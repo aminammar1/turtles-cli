@@ -1,0 +1,38 @@
+[project]
+name = "turtles-cli"
+version = "0.1.0"
+description = "Turtles CLI: a project-level pre-tool for preparing, auditing, evaluating, and optimizing coding workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Turtles CLI Contributors" }]
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.27.0",
+    "prompt-toolkit>=3.0.48",
+    "pydantic>=2.7.0",
+    "rich>=13.7.0",
+    "typer>=0.12.0",
+    "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+]
+
+[project.scripts]
+turtle = "turtles_cli.main:app"
+turtles = "turtles_cli.main:app"
+turtles-server = "turtles_cli.server:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["turtles_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
