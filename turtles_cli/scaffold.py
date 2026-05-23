@@ -5,12 +5,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+ASSISTANT_TARGETS = ("claude", "codex", "gemini")
+
 
 @dataclass(frozen=True)
 class ScaffoldResult:
     kind: str
     name: str
     path: Path
+    paths: tuple[Path, ...] = ()
 
 
 def slugify(value: str) -> str:
@@ -18,13 +21,20 @@ def slugify(value: str) -> str:
     return slug or "turtle-extension"
 
 
-def create_skill(root: Path, name: str, description: str, *, allowed_tools: str = "Read Grep Glob Bash") -> ScaffoldResult:
-    slug = slugify(name)
-    directory = root / ".claude" / "skills" / slug
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / "SKILL.md"
-    path.write_text(
-        f"""---
+def normalize_targets(target: str | list[str] | tuple[str, ...] = "all") -> tuple[str, ...]:
+    if isinstance(target, str):
+        raw_targets = ASSISTANT_TARGETS if target == "all" else (target,)
+    else:
+        raw_targets = tuple(target)
+    targets = tuple(dict.fromkeys(raw_targets))
+    invalid = [value for value in targets if value not in ASSISTANT_TARGETS]
+    if invalid:
+        raise ValueError(f"Unknown assistant target: {', '.join(invalid)}")
+    return targets
+
+
+def skill_body(name: str, slug: str, description: str, *, allowed_tools: str = "Read Grep Glob Bash") -> str:
+    return f"""---
 name: {slug}
 description: {description}
 allowed-tools: {allowed_tools}
@@ -47,21 +57,11 @@ Use this skill when: {description}
 
 ## Notes
 Keep the work project-level. Do not access machine-level, enterprise, or unrelated resources.
-""",
-        encoding="utf-8",
-    )
-    (directory / "examples").mkdir(exist_ok=True)
-    (directory / "scripts").mkdir(exist_ok=True)
-    return ScaffoldResult("skill", slug, path)
+"""
 
 
-def create_subagent(root: Path, name: str, description: str, *, tools: str = "Read, Grep, Glob, Bash") -> ScaffoldResult:
-    slug = slugify(name)
-    directory = root / ".claude" / "agents"
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{slug}.md"
-    path.write_text(
-        f"""---
+def subagent_body(name: str, slug: str, description: str, *, tools: str = "Read, Grep, Glob, Bash") -> str:
+    return f"""---
 name: {slug}
 description: {description}
 tools: {tools}
@@ -69,7 +69,7 @@ tools: {tools}
 
 # {name}
 
-You are a focused project-level subagent for Turtles CLI.
+You are a focused project-level subagent for this repository.
 
 ## Mission
 {description}
@@ -84,20 +84,84 @@ You are a focused project-level subagent for Turtles CLI.
 1. What you checked
 2. Findings
 3. Recommended next step
-""",
-        encoding="utf-8",
-    )
-    return ScaffoldResult("subagent", slug, path)
+"""
 
 
-def create_plugin(root: Path, name: str, description: str, *, author: str = "Turtles CLI user") -> ScaffoldResult:
+def upsert_instruction_block(path: Path, marker: str, title: str, body: str) -> None:
+    start = f"<!-- turtles-cli:{marker}:start -->"
+    end = f"<!-- turtles-cli:{marker}:end -->"
+    block = f"{start}\n## {title}\n\n{body.strip()}\n{end}\n"
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if start in existing and end in existing:
+        before, rest = existing.split(start, 1)
+        _, after = rest.split(end, 1)
+        content = before.rstrip() + "\n\n" + block + after.lstrip()
+    else:
+        content = existing.rstrip() + ("\n\n" if existing.strip() else "") + block
+    path.write_text(content, encoding="utf-8")
+
+
+def create_skill(root: Path, name: str, description: str, *, allowed_tools: str = "Read Grep Glob Bash", target: str | list[str] | tuple[str, ...] = "all") -> ScaffoldResult:
     slug = slugify(name)
+    content = skill_body(name, slug, description, allowed_tools=allowed_tools)
+    targets = normalize_targets(target)
+    paths = tuple(root / f".{assistant}" / "skills" / slug / "SKILL.md" for assistant in targets)
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        (path.parent / "examples").mkdir(exist_ok=True)
+        (path.parent / "scripts").mkdir(exist_ok=True)
+    if "codex" in targets:
+        upsert_instruction_block(
+            root / "AGENTS.md",
+            f"skill-{slug}",
+            f"Codex skill: {slug}",
+            f"Use `.codex/skills/{slug}/SKILL.md` when the task matches: {description}",
+        )
+    if "gemini" in targets:
+        upsert_instruction_block(
+            root / "GEMINI.md",
+            f"skill-{slug}",
+            f"Gemini skill: {slug}",
+            f"Use `.gemini/skills/{slug}/SKILL.md` when the task matches: {description}",
+        )
+    return ScaffoldResult("skill", slug, paths[0], paths)
+
+
+def create_subagent(root: Path, name: str, description: str, *, tools: str = "Read, Grep, Glob, Bash", target: str | list[str] | tuple[str, ...] = "all") -> ScaffoldResult:
+    slug = slugify(name)
+    content = subagent_body(name, slug, description, tools=tools)
+    targets = normalize_targets(target)
+    paths = tuple(root / f".{assistant}" / "agents" / f"{slug}.md" for assistant in targets)
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    if "codex" in targets:
+        upsert_instruction_block(
+            root / "AGENTS.md",
+            f"subagent-{slug}",
+            f"Codex subagent: {slug}",
+            f"Delegate focused review to `.codex/agents/{slug}.md` when useful. Mission: {description}",
+        )
+    if "gemini" in targets:
+        upsert_instruction_block(
+            root / "GEMINI.md",
+            f"subagent-{slug}",
+            f"Gemini subagent: {slug}",
+            f"Delegate focused review to `.gemini/agents/{slug}.md` when useful. Mission: {description}",
+        )
+    return ScaffoldResult("subagent", slug, paths[0], paths)
+
+
+def create_plugin(root: Path, name: str, description: str, *, author: str = "Turtles CLI user", target: str | list[str] | tuple[str, ...] = "all") -> ScaffoldResult:
+    slug = slugify(name)
+    targets = normalize_targets(target)
     directory = root / "plugins" / slug
-    manifest_dir = directory / ".claude-plugin"
     skill_dir = directory / "skills" / "review"
     agent_dir = directory / "agents"
     hooks_dir = directory / "hooks"
-    for path in (manifest_dir, skill_dir, agent_dir, hooks_dir, directory / "bin"):
+    manifest_dirs = tuple(directory / f".{assistant}-plugin" for assistant in targets)
+    for path in (*manifest_dirs, skill_dir, agent_dir, hooks_dir, directory / "bin"):
         path.mkdir(parents=True, exist_ok=True)
 
     manifest = {
@@ -107,10 +171,12 @@ def create_plugin(root: Path, name: str, description: str, *, author: str = "Tur
         "author": {"name": author},
         "license": "MIT",
     }
-    manifest_path = manifest_dir / "plugin.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_paths = tuple(path / "plugin.json" for path in manifest_dirs)
+    for manifest_path in manifest_paths:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     (skill_dir / "SKILL.md").write_text(
         f"""---
+name: {slug}-review
 description: {description}
 ---
 
@@ -140,18 +206,30 @@ Review the project for {description}. Stay project-scoped and provide actionable
 {description}
 
 ## Structure
-- `.claude-plugin/plugin.json`: plugin manifest
+- `.claude-plugin/plugin.json`: Claude plugin manifest
+- `.codex-plugin/plugin.json`: Codex plugin manifest
+- `.gemini-plugin/plugin.json`: Gemini plugin manifest
 - `skills/`: plugin skills
 - `agents/`: plugin agents
 - `hooks/`: hook configuration
 - `bin/`: executable helpers
 
-Test locally with a Claude-compatible plugin loader, for example:
-
-```bash
-claude --plugin-dir ./plugins/{slug}
-```
+Load this folder with the assistant/plugin loader that supports your target tool.
 """,
         encoding="utf-8",
     )
-    return ScaffoldResult("plugin", slug, manifest_path)
+    if "codex" in targets:
+        upsert_instruction_block(
+            root / "AGENTS.md",
+            f"plugin-{slug}",
+            f"Codex plugin: {slug}",
+            f"Plugin files live in `plugins/{slug}`. Use them for: {description}",
+        )
+    if "gemini" in targets:
+        upsert_instruction_block(
+            root / "GEMINI.md",
+            f"plugin-{slug}",
+            f"Gemini plugin: {slug}",
+            f"Plugin files live in `plugins/{slug}`. Use them for: {description}",
+        )
+    return ScaffoldResult("plugin", slug, manifest_paths[0], manifest_paths)

@@ -4,11 +4,15 @@ from pathlib import Path
 import sys
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.completion import Completer, Completion, WordCompleter
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.widgets import FormattedTextToolbar
+from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 
 from .config import TurtlesConfig
@@ -19,7 +23,10 @@ from .session import history_path
 
 COMMANDS = [
     "/login",
+    "/logout",
     "/models",
+    "/test-model",
+    "/test-ai",
     "/provider",
     "/customize-cli",
     "/skills",
@@ -28,6 +35,7 @@ COMMANDS = [
     "/plugins",
     "/init",
     "/docs",
+    "/doc",
     "/code-review",
     "/security",
     "/mcp",
@@ -57,7 +65,10 @@ COMMANDS = [
 
 COMMAND_DESCRIPTIONS = {
     "/login": "configure provider credentials",
+    "/logout": "clear project credentials",
     "/models": "list or switch models",
+    "/test-model": "test active model connectivity",
+    "/test-ai": "alias for test-model",
     "/provider": "switch provider",
     "/customize-cli": "change CLI display settings",
     "/skills": "manage skills",
@@ -65,7 +76,8 @@ COMMAND_DESCRIPTIONS = {
     "/hooks": "manage lifecycle hooks",
     "/plugins": "manage plugins",
     "/init": "initialize project config",
-    "/docs": "generate project rules docs",
+    "/docs": "create custom instruction file",
+    "/doc": "alias for docs",
     "/code-review": "review current project",
     "/security": "scan secrets and risky patterns",
     "/mcp": "manage MCP servers",
@@ -165,6 +177,8 @@ def make_command_session(root: Path, mode: TurtleMode, config: TurtlesConfig) ->
 
 
 def choose_from_keyboard(title: str, choices: list[str], *, default: str) -> str:
+    if not choices:
+        return default
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         try:
             answer = input(f"{title} [{default}] > ").strip()
@@ -177,20 +191,103 @@ def choose_from_keyboard(title: str, choices: list[str], *, default: str) -> str
                 return choice
         return default
 
-    completer = WordCompleter(choices, ignore_case=True, match_middle=True)
-    session: PromptSession[str] = PromptSession(
-        completer=completer,
-        complete_while_typing=True,
-        reserve_space_for_menu=min(8, len(choices) + 1),
-        bottom_toolbar="  Type, Tab complete, Enter select",
+    selected = choices.index(default) if default in choices else 0
+    query = ""
+    filtered = list(range(len(choices)))
+
+    def current_choice() -> str:
+        return choices[filtered[selected % len(filtered)]] if filtered else default
+
+    def refresh_filter() -> None:
+        nonlocal selected, filtered
+        needle = query.lower()
+        filtered = [index for index, choice in enumerate(choices) if needle in choice.lower()]
+        if not filtered:
+            filtered = list(range(len(choices)))
+        selected = min(selected, len(filtered) - 1)
+
+    def formatted_text():
+        lines = [("class:title", f"{title}\n"), ("class:help", "↑/↓ or j/k move · 1-9 jump · type filters · Enter selects · Esc cancels\n\n")]
+        if query:
+            lines.append(("class:help", f"filter: {query}\n"))
+        visible = filtered[:9]
+        for row, choice_index in enumerate(visible):
+            choice = choices[choice_index]
+            pointer = "▶" if row == selected else " "
+            style = "class:current" if row == selected else "class:item"
+            lines.append((style, f"{pointer} {row + 1}. {choice}\n"))
+        return lines
+
+    bindings = KeyBindings()
+
+    @bindings.add("up")
+    @bindings.add("k")
+    def _(event) -> None:
+        nonlocal selected
+        selected = (selected - 1) % len(filtered)
+        event.app.invalidate()
+
+    @bindings.add("down")
+    @bindings.add("j")
+    def _(event) -> None:
+        nonlocal selected
+        selected = (selected + 1) % len(filtered)
+        event.app.invalidate()
+
+    @bindings.add("backspace")
+    def _(event) -> None:
+        nonlocal query
+        query = query[:-1]
+        refresh_filter()
+        event.app.invalidate()
+
+    @bindings.add("enter")
+    def _(event) -> None:
+        event.app.exit(result=current_choice())
+
+    @bindings.add("escape")
+    @bindings.add("c-c")
+    def _(event) -> None:
+        event.app.exit(result=default)
+
+    for key in [str(number) for number in range(1, 10)]:
+        @bindings.add(key)
+        def _(event, key=key) -> None:
+            nonlocal selected
+            index = int(key) - 1
+            if index < len(filtered):
+                selected = index
+                event.app.exit(result=current_choice())
+
+    @bindings.add("<any>")
+    def _(event) -> None:
+        nonlocal query, selected
+        data = event.data
+        if data and data.isprintable():
+            query += data
+            selected = 0
+            refresh_filter()
+            event.app.invalidate()
+
+    app: Application[str] = Application(
+        layout=Layout(
+            HSplit(
+                [
+                    Window(FormattedTextControl(formatted_text), always_hide_cursor=True),
+                    FormattedTextToolbar(lambda: "Turtles CLI keyboard selector"),
+                ]
+            )
+        ),
+        key_bindings=bindings,
+        full_screen=False,
+        style=Style.from_dict(
+            {
+                "title": "bold #67d587",
+                "help": "#8a8a8a",
+                "item": "#d0d0d0",
+                "current": "bold #101010 bg:#67d587",
+            }
+        ),
     )
-    answer = session.prompt(f"{title} [{default}] > ").strip()
-    if not answer:
-        return default
-    if answer in choices:
-        return answer
-    lowered = answer.lower()
-    for choice in choices:
-        if choice.lower() == lowered or choice.lower().startswith(lowered):
-            return choice
-    return default
+    result = app.run()
+    return result or default

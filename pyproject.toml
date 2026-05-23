@@ -3,7 +3,7 @@ name = "turtles-cli"
 version = "0.1.0"
 description = "Turtles CLI: a project-level pre-tool for preparing, auditing, evaluating, and optimizing coding workflows."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 license = { text = "MIT" }
 authors = [{ name = "Turtles CLI Contributors" }]
 dependencies = [

@@ -150,13 +150,26 @@ def ai_detect(root: Path) -> tuple[int, list[Finding]]:
     return estimate, findings
 
 
-def context_usage(messages: list[str] | None = None) -> dict[str, int]:
+def context_usage(messages: list[str] | None = None, *, window: int = 128_000, model: str = "model") -> dict[str, object]:
     messages = messages or []
-    token_estimate = sum(max(1, len(message) // 4) for message in messages)
-    window = 128_000
+    message_tokens = sum(max(1, len(message) // 4) for message in messages)
+    categories = {
+        "system_prompt": 2_600,
+        "system_tools": 17_600,
+        "mcp_tools": 900,
+        "custom_agents": 900,
+        "memory_files": 300,
+        "skills": 100,
+        "messages": message_tokens,
+    }
+    used = sum(categories.values())
+    autocompact_buffer = round(window * 0.165)
     return {
-        "used": token_estimate,
-        "remaining": max(0, window - token_estimate),
+        "used": used,
+        "remaining": max(0, window - used - autocompact_buffer),
         "window": window,
         "segments": len(messages),
+        "model": model,
+        "categories": categories,
+        "autocompact_buffer": autocompact_buffer,
     }

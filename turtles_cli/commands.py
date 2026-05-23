@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import getpass
 import html
+import os
 import re
+import shlex
+import shutil
 import subprocess
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import httpx
 from rich import box
@@ -14,14 +16,14 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from .audits import Finding, ai_detect, code_review, context_usage, docker_audit, security_audit
-from .config import ProviderConfig, TurtlesConfig, init_project, is_logged_in, load_config, redacted_config, save_config
+from .config import ProviderConfig, TurtlesConfig, init_project, is_logged_in, load_config, save_config
+from .llm import LLMError, complete_text, provider_ready
 from .modes import TurtleMode, get_mode
 from .prompting import choose_from_keyboard
-from .prompts import enhance_prompt, evaluate_prompt, simulation_grade
 from .providers import PROVIDERS
 from .scaffold import create_plugin, create_skill, create_subagent
 from .session import load_cache
-from .ui import console, masked_prompt, panel, shell_problem, status
+from .ui import console, markdown_panel, masked_prompt, panel, processing_animation, render_context_usage, shell_problem, status
 
 
 CommandHandler = Callable[[list[str], Path, TurtlesConfig], TurtlesConfig]
@@ -47,21 +49,71 @@ def print_findings(findings: list[Finding], title: str, mode: TurtleMode) -> Non
     console.print(table)
 
 
+def run_with_animation(message: str, mode: TurtleMode, action: Callable[[], object]) -> object:
+    with processing_animation(message, mode):
+        return action()
+
+
+def project_signal_context(root: Path, config: TurtlesConfig) -> str:
+    names = sorted(path.name for path in root.iterdir() if not path.name.startswith(".") or path.name in {".github", ".gitignore"})
+    visible = ", ".join(names[:40]) if names else "empty project"
+    return (
+        f"Project: {root.name}\n"
+        f"Top-level files/directories: {visible}\n"
+        f"Configured MCP servers: {', '.join(config.mcp_servers) or 'none'}\n"
+        f"Configured skills: {', '.join(config.skills) or 'none'}\n"
+        f"Configured subagents: {', '.join(config.subagents) or 'none'}"
+    )
+
+
+def choose_assistant_target() -> str:
+    selected = choose_from_keyboard("Assistant target", ["claude", "codex", "gemini", "all"], default="claude")
+    return selected
+
+
 def handle_login(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     providers = list(PROVIDERS.values())
     default_provider = PROVIDERS.get(config.provider.provider, PROVIDERS["openrouter"])
     provider_label = choose_from_keyboard("Provider", [provider.label for provider in providers], default=default_provider.label)
     provider = next(provider for provider in providers if provider.label == provider_label)
-    username = Prompt.ask("Username", default=config.provider.username or getpass.getuser())
+    username = Prompt.ask("Username", default=config.provider.username or "user")
+    base_url = config.provider.base_url if config.provider.provider == provider.key else ""
+    if provider.requires_base_url or provider.key in {"custom", "azure-openai"}:
+        base_url = Prompt.ask("API base URL", default=base_url or provider.base_url or "https://api.example.com/v1")
+    elif provider.base_url and Confirm.ask("Customize API base URL?", default=False):
+        base_url = Prompt.ask("API base URL", default=base_url or provider.base_url)
+
     secret_label = "Ollama host" if provider.key == "ollama" else f"{provider.label} API key"
     if provider.key == "ollama":
-        api_key = Prompt.ask(secret_label, default="http://127.0.0.1:11434")
+        api_key = Prompt.ask(secret_label, default=base_url or provider.base_url)
     else:
-        api_key = masked_prompt(secret_label)
-    model = choose_from_keyboard("Default model", list(provider.default_models), default=provider.default_models[0])
-    config.provider = ProviderConfig(provider=provider.key, username=username, api_key=api_key, model=model)
+        env_secret = os.environ.get(provider.env_var, "")
+        if env_secret and Confirm.ask(f"Use {provider.env_var} from environment?", default=True):
+            api_key = env_secret
+        else:
+            api_key = masked_prompt(secret_label)
+    model = choose_model(provider.default_models, config.provider.model if config.provider.provider == provider.key else "")
+    config.provider = ProviderConfig(provider=provider.key, username=username, api_key=api_key, model=model, base_url=base_url)
     save_config(config, root)
     status(f"Logged in to {provider.label} for this project.", get_mode(config.mode), style="green")
+    return config
+
+
+def choose_model(default_models: tuple[str, ...], current_model: str = "") -> str:
+    choices = list(default_models)
+    if current_model and current_model not in choices:
+        choices.insert(0, current_model)
+    choices.append("Custom model...")
+    selected = choose_from_keyboard("Default model", choices, default=current_model or choices[0])
+    if selected == "Custom model...":
+        return Prompt.ask("Model id", default=current_model or default_models[0])
+    return selected
+
+
+def handle_logout(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
+    config.provider = ProviderConfig()
+    save_config(config, root)
+    status("Cleared project provider credentials.", get_mode(config.mode), style="green")
     return config
 
 
@@ -76,12 +128,41 @@ def handle_models(args: list[str], root: Path, config: TurtlesConfig) -> Turtles
     table.add_column("#", justify="right")
     table.add_column("Model")
     table.add_column("Active")
-    for index, model in enumerate(provider.default_models, start=1):
+    models = list(provider.default_models)
+    if config.provider.model and config.provider.model not in models:
+        models.insert(0, config.provider.model)
+    for index, model in enumerate(models, start=1):
         table.add_row(str(index), model, "yes" if model == config.provider.model else "")
     console.print(table)
     if Confirm.ask("Switch model?", default=False):
-        config.provider.model = choose_from_keyboard("Model", list(provider.default_models), default=config.provider.model or provider.default_models[0])
+        config.provider.model = choose_model(provider.default_models, config.provider.model)
         save_config(config, root)
+        status(f"Active model: {config.provider.model}", get_mode(config.mode), style="green")
+    return config
+
+
+def handle_test_model(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
+    mode = get_mode(config.mode)
+    if not require_login(config):
+        return config
+    prompt = "Reply with one short sentence confirming model connectivity."
+    try:
+        with processing_animation(
+            "Testing model connectivity",
+            mode,
+            phases=["checking active provider", "preparing request", "waiting for model", "reading response"],
+        ):
+            response = complete_text(
+                config,
+                "You are a connectivity test endpoint. Keep the response short.",
+                prompt,
+                timeout=20.0,
+            )
+    except LLMError as exc:
+        shell_problem(f"Model connectivity failed. {exc}")
+        return config
+    body = f"provider: {response.provider}\nmodel: {response.model}\nresponse: {response.text or '[empty response]'}"
+    panel("Model connectivity ok", body, mode, border_style="green")
     return config
 
 
@@ -101,7 +182,7 @@ def handle_customize(args: list[str], root: Path, config: TurtlesConfig) -> Turt
 def handle_simple_registry(kind: str, args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     mode = get_mode(config.mode)
     collection = getattr(config, kind)
-    action = choose_from_keyboard(f"{kind} action", ["list", "install", "create", "generate"], default="list")
+    action = choose_from_keyboard(f"{kind} action", ["list", "install", "create"], default="list")
     if action == "list":
         base = root / ".claude" / ("skills" if kind == "skills" else "agents")
         files = []
@@ -117,13 +198,15 @@ def handle_simple_registry(kind: str, args: list[str], root: Path, config: Turtl
     else:
         name = Prompt.ask(f"{kind[:-1].title()} name")
         description = Prompt.ask("Description")
+        target = choose_assistant_target()
         if kind == "skills":
-            result = create_skill(root, name, description)
+            result = create_skill(root, name, description, target=target)
         else:
-            result = create_subagent(root, name, description)
+            result = create_subagent(root, name, description, target=target)
         collection.append(str(result.path.relative_to(root)))
         save_config(config, root)
-        status(f"Created {result.kind}: {result.path.relative_to(root)}", mode)
+        created = [str(path.relative_to(root)) for path in result.paths] if result.paths else [str(result.path.relative_to(root))]
+        status(f"Created {result.kind}: " + ", ".join(created), mode)
     return config
 
 
@@ -141,10 +224,12 @@ def handle_plugins(args: list[str], root: Path, config: TurtlesConfig) -> Turtle
     elif action == "create":
         name = Prompt.ask("Plugin name")
         description = Prompt.ask("Description")
-        result = create_plugin(root, name, description, author=config.provider.username or "Turtles CLI user")
+        target = choose_assistant_target()
+        result = create_plugin(root, name, description, author=config.provider.username or "Turtles CLI user", target=target)
         config.plugins[str(result.path.parent.parent.relative_to(root))] = True
         save_config(config, root)
-        status(f"Created plugin: {result.path.relative_to(root)}", get_mode(config.mode))
+        created = [str(path.relative_to(root)) for path in result.paths] if result.paths else [str(result.path.relative_to(root))]
+        status("Created plugin: " + ", ".join(created), get_mode(config.mode))
     else:
         name = Prompt.ask("Plugin name")
         config.plugins[name] = action == "enable"
@@ -170,47 +255,77 @@ def handle_hooks(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesC
 
 
 def handle_init(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    init_project(root)
-    status(f"Initialized {root / '.turtles' / 'config.json'}", get_mode(config.mode))
+    mode = get_mode(config.mode)
+    target = root / "TURTLE.md"
+    body = f"""# TURTLE.md
+
+## Project Instructions
+- Work only inside this repository unless the user explicitly says otherwise.
+- Keep secrets, tokens, and local runtime files out of commits.
+- Prefer focused edits and project-local tests.
+- Use `/code-review`, `/security`, `/docker`, and `/context` before large assistant tasks.
+
+## Active Mode
+- {mode.name}: {mode.focus}
+
+## Assistant Files
+- Claude: `CLAUDE.md`
+- Codex: `AGENTS.md`
+- Gemini: `GEMINI.md`
+- Turtles CLI: `TURTLE.md`
+"""
+    def write_files() -> None:
+        init_project(root)
+        target.write_text(body, encoding="utf-8")
+
+    run_with_animation("Initializing project instructions", mode, write_files)
+    status(f"Initialized .turtles/config.json and {target.name}", mode)
     return load_config(root)
 
 
 def handle_docs(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    target = root / "TURTLES.md"
-    body = f"""# Turtles CLI Project Rules
-
-Mode: {get_mode(config.mode).name}
-Provider: {config.provider.provider or "not configured"}
-
-## Scope
-- Operate only inside this project folder.
-- Keep credentials out of source control.
-- Use `/security`, `/code-review`, `/prompt-eval`, and `/simulation` before handing work to a coding assistant.
-
-## Workflow
-- Start with project trust.
-- Run audits before large changes.
-- Prefer explicit prompts with files, constraints, tests, and expected output.
-"""
-    target.write_text(body, encoding="utf-8")
-    status(f"Wrote {target}", get_mode(config.mode))
+    mode = get_mode(config.mode)
+    filename = args[0] if args else Prompt.ask("Instruction filename", default="backend.md")
+    if Path(filename).is_absolute() or ".." in Path(filename).parts:
+        shell_problem("Docs filename must stay inside the project root.")
+        return config
+    if not filename.endswith(".md"):
+        filename = f"{filename}.md"
+    goal = " ".join(args[1:]) if len(args) > 1 else Prompt.ask("What should this instruction file cover?")
+    body = ai_or_error(
+        config,
+        mode,
+        "Create a concise project instruction Markdown file for a coding assistant. Return only Markdown.",
+        f"Filename: {filename}\nProject root: {root.name}\nRequested content: {goal}",
+    )
+    if not body:
+        return config
+    target = root / filename
+    with processing_animation(f"Writing {filename}", mode):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body.rstrip() + "\n", encoding="utf-8")
+    status(f"Wrote {target.relative_to(root)}", mode)
     return config
 
 
 def handle_code_review(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     target = args[0] if args else None
-    print_findings(code_review(root, target), "Code Review", get_mode(config.mode))
+    mode = get_mode(config.mode)
+    findings = run_with_animation("Running code review", mode, lambda: code_review(root, target))
+    print_findings(findings, "Code Review", mode)
     return config
 
 
 def handle_security(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     target = args[0] if args else None
-    print_findings(security_audit(root, target), "Security Audit", get_mode(config.mode))
+    mode = get_mode(config.mode)
+    findings = run_with_animation("Running security audit", mode, lambda: security_audit(root, target))
+    print_findings(findings, "Security Audit", mode)
     return config
 
 
 def handle_mcp(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    action = args[0] if args else Prompt.ask("MCP action", choices=["list", "add-url", "add-stdio"], default="list")
+    action = args[0] if args else choose_from_keyboard("MCP action", ["list", "check-github", "add-url", "add-stdio"], default="list")
     if action == "list":
         table = Table(title="MCP Servers", box=box.SIMPLE_HEAVY)
         table.add_column("Name")
@@ -230,73 +345,129 @@ def handle_mcp(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCon
         command = Prompt.ask("stdio command")
         config.mcp_servers[name] = {"enabled": True, "transport": "stdio", "command": command, "scope": "project"}
         save_config(config, root)
+    elif action in {"check", "check-github", "github"}:
+        mode = get_mode(config.mode)
+        body = run_with_animation("Checking GitHub MCP", mode, lambda: github_mcp_diagnostics(config))
+        panel("GitHub MCP", body, mode)
     return config
 
 
+def github_mcp_diagnostics(config: TurtlesConfig) -> str:
+    server = config.mcp_servers.get("github", {})
+    command = str(server.get("command") or "github-mcp-server")
+    executable = shlex.split(command)[0] if command else "github-mcp-server"
+    found = shutil.which(executable)
+    lines = [
+        f"configured: {'yes' if server else 'no'}",
+        f"enabled: {server.get('enabled', False)}",
+        f"transport: {server.get('transport', '')}",
+        f"command: {command}",
+        f"found on PATH: {'yes - ' + found if found else 'no'}",
+        f"GITHUB_TOKEN set: {'yes' if os.environ.get('GITHUB_TOKEN') else 'no'}",
+    ]
+    if found:
+        try:
+            result = subprocess.run(shlex.split(command) + ["--help"], text=True, capture_output=True, check=False, timeout=5)
+            output = (result.stdout or result.stderr).strip().splitlines()
+            lines.append(f"help check exit: {result.returncode}")
+            if output:
+                lines.append(f"help check first line: {output[0]}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            lines.append(f"help check failed: {exc}")
+    else:
+        lines.append("fix: install GitHub's github-mcp-server and make it visible on PATH, or update /mcp add-stdio.")
+    return "\n".join(lines)
+
+
 def handle_mcp_suggestion(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    suggestions = ["github: enabled by default for repository work"]
-    if (root / "package.json").exists():
-        suggestions.append("filesystem/search MCP for JS monorepo navigation")
-    if (root / "pyproject.toml").exists():
-        suggestions.append("python tooling MCP for package/test metadata")
-    panel("MCP suggestions", "\n".join(suggestions), get_mode(config.mode))
+    mode = get_mode(config.mode)
+    body = ai_or_error(
+        config,
+        mode,
+        "Recommend concrete MCP servers for this repository. Avoid placeholders. Explain why each server is useful and how to verify it.",
+        project_signal_context(root, config),
+    )
+    if body:
+        markdown_panel("MCP suggestions", body, mode)
     return config
 
 
 def handle_docker(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    print_findings(docker_audit(root), "Docker Audit", get_mode(config.mode))
+    mode = get_mode(config.mode)
+    findings = run_with_animation("Running Docker audit", mode, lambda: docker_audit(root))
+    print_findings(findings, "Docker Audit", mode)
     return config
 
 
 def handle_api(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    suggestions = [
-        "GitHub REST/GraphQL API: repository automation and release workflows.",
-        "OpenAPI-compatible public APIs: generate clients and validation from specs.",
-        "Stack Exchange API: developer knowledge lookup for docs/support tools.",
-    ]
-    panel("API suggestions", "\n".join(suggestions), get_mode(config.mode))
+    mode = get_mode(config.mode)
+    body = ai_or_error(
+        config,
+        mode,
+        "Suggest concrete APIs that would be useful for this repository. Avoid generic placeholders.",
+        project_signal_context(root, config),
+    )
+    if body:
+        markdown_panel("API suggestions", body, mode)
     return config
 
 
 def handle_ai(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    suggestions = [
-        "Ollama: local models such as Llama, Mistral, and Qwen Coder.",
-        "OpenRouter: broad hosted model routing, including free/community tiers when available.",
-        "Google AI Studio: Gemini models for prototyping.",
-        "Hugging Face: open models and inference providers for experiments.",
-    ]
-    panel("AI options", "\n".join(suggestions), get_mode(config.mode))
+    mode = get_mode(config.mode)
+    body = ai_or_error(
+        config,
+        mode,
+        "Recommend AI provider/model options for this repository's workflow. Be concrete and avoid mock provider behavior.",
+        project_signal_context(root, config),
+    )
+    if body:
+        markdown_panel("AI options", body, mode)
     return config
 
 
 def handle_github(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    subcommand = args[0] if args else "status"
-    commands = {
+    choices = ["status", "branch", "commit", "push", "pr-create", "pr-list", "issue-list", "repo-view", "mcp-check"]
+    subcommand = args[0] if args else choose_from_keyboard("GitHub action", choices, default="status")
+    commands: dict[str, list[str]] = {
         "status": ["git", "status", "--short"],
         "branch": ["git", "branch", "--show-current"],
         "push": ["git", "push"],
+        "pr-list": ["gh", "pr", "list"],
+        "issue-list": ["gh", "issue", "list"],
+        "repo-view": ["gh", "repo", "view"],
     }
+    if subcommand == "mcp-check":
+        mode = get_mode(config.mode)
+        body = run_with_animation("Checking GitHub MCP", mode, lambda: github_mcp_diagnostics(config))
+        panel("GitHub MCP", body, mode)
+        return config
     if subcommand == "commit":
         message = " ".join(args[1:]) or Prompt.ask("Commit message")
-        command = ["git", "add", "."] 
-        subprocess.run(command, cwd=root, check=False)
-        result = subprocess.run(["git", "commit", "-m", message], cwd=root, text=True, capture_output=True, check=False)
-    elif subcommand == "pr":
-        result = subprocess.run(["gh", "pr", "create", "--web"], cwd=root, text=True, capture_output=True, check=False)
+        command = ["git", "add", "."]
+        with processing_animation("Creating git commit", get_mode(config.mode)):
+            subprocess.run(command, cwd=root, check=False)
+            result = subprocess.run(["git", "commit", "-m", message], cwd=root, text=True, capture_output=True, check=False)
+    elif subcommand in {"pr", "pr-create"}:
+        with processing_animation("Creating GitHub PR", get_mode(config.mode)):
+            result = subprocess.run(["gh", "pr", "create", "--web"], cwd=root, text=True, capture_output=True, check=False)
     else:
-        result = subprocess.run(commands.get(subcommand, ["git", subcommand]), cwd=root, text=True, capture_output=True, check=False)
+        with processing_animation(f"Running github {subcommand}", get_mode(config.mode)):
+            result = subprocess.run(commands.get(subcommand, ["git", subcommand]), cwd=root, text=True, capture_output=True, check=False)
     output = result.stdout or result.stderr or "No output."
     panel(f"github {subcommand}", output.strip(), get_mode(config.mode))
     return config
 
 
 def handle_suggest(kind: str, args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    suggestions = {
-        "skills": ["prompt-evaluation", "security-audit", "docker-hardening"],
-        "plugins": ["github", "netlify", "hugging-face"],
-        "subagents": ["reviewer", "security analyst", "prompt critic"],
-    }
-    panel(f"Suggested {kind}", "\n".join(suggestions[kind]), get_mode(config.mode))
+    mode = get_mode(config.mode)
+    body = ai_or_error(
+        config,
+        mode,
+        f"Suggest concrete {kind} to create for this repository. Avoid mock names. Include the exact purpose for each.",
+        project_signal_context(root, config),
+    )
+    if body:
+        markdown_panel(f"Suggested {kind}", body, mode)
     return config
 
 
@@ -311,15 +482,29 @@ def handle_create_prompt(args: list[str], root: Path, config: TurtlesConfig) -> 
 
 def handle_enhance_prompt(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     prompt = " ".join(args) or Prompt.ask("Prompt")
-    panel("Enhanced prompt", enhance_prompt(prompt), get_mode(config.mode))
+    mode = get_mode(config.mode)
+    body = ai_or_error(
+        config,
+        mode,
+        "Enhance this prompt for a coding assistant. Return only the improved prompt with concise sections.",
+        prompt,
+    )
+    if body:
+        markdown_panel("Enhanced prompt", body, mode)
     return config
 
 
 def handle_prompt_eval(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     prompt = " ".join(args) or Prompt.ask("Prompt")
-    score, notes = evaluate_prompt(prompt)
-    body = f"Clarity: {score.clarity}\nSpecificity: {score.specificity}\nSafety: {score.safety}\nOutput quality: {score.output_quality}\nTotal: {score.total}\n\n" + ("\n".join(notes) if notes else "Strong prompt shape.")
-    panel("Prompt evaluation", body, get_mode(config.mode))
+    mode = get_mode(config.mode)
+    body = ai_or_error(
+        config,
+        mode,
+        "Evaluate the prompt for a coding assistant. Score clarity, specificity, safety, and output quality from 0-100. Include concise fixes.",
+        prompt,
+    )
+    if body:
+        markdown_panel("Prompt evaluation", body, mode)
     return config
 
 
@@ -327,28 +512,20 @@ def handle_simulation(args: list[str], root: Path, config: TurtlesConfig) -> Tur
     console.print("[yellow]Important: a simulation scenario is just a prompt with optional skills, sub-agents, or plugins. It does not execute the work.[/yellow]")
     prompt = " ".join(args) or Prompt.ask("Scenario prompt")
     code_involved = Confirm.ask("Does this scenario involve code?", default=True)
-    grade = simulation_grade(prompt, code_involved)
-    body = "\n".join(f"{key}: {value}" for key, value in grade.items())
-    panel("Simulation grade", body, get_mode(config.mode))
+    mode = get_mode(config.mode)
+    body = ai_or_error(
+        config,
+        mode,
+        "Simulate how a coding assistant would handle this scenario. Return a concise risk/plan/test assessment with a final readiness grade.",
+        f"Code involved: {code_involved}\n\nScenario:\n{prompt}",
+    )
+    if body:
+        markdown_panel("Simulation grade", body, mode)
     return config
 
 
 def handle_turtle_mode(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    body = """Turtle Mode will simulate a multi-agent dance across the project:
-
-- Leonardo coordinates strategy and acceptance criteria.
-- Donatello maps architecture, dependencies, and tool choices.
-- Raphael attacks risk, security, and regression hotspots.
-- Michelangelo explores creative prompts and alternate workflows.
-
-Interface stub:
-1. Select roles.
-2. Assign project slices.
-3. Run parallel evaluations.
-4. Merge findings into a single workflow report.
-
-# TODO: implement multi-agent orchestration in a future release."""
-    panel("Turtle Mode", body, get_mode(config.mode))
+    shell_problem("Turtle Mode orchestration is not implemented yet. No mock run was started.")
     return config
 
 
@@ -358,23 +535,26 @@ def handle_help(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCo
     table.add_column("Purpose")
     commands = {
         "/login": "Configure project-scoped provider credentials.",
+        "/logout": "Clear project-scoped provider credentials.",
         "/models": "List and switch models for the active provider.",
+        "/test-model": "Send a live request to verify the active provider/model.",
         "/provider": "Switch provider or re-authenticate.",
         "/customize-cli": "Change prompt style, theme, verbosity, and animation.",
-        "/skills": "Install or generate skills.",
-        "/subagents": "Install or generate sub-agents.",
+        "/skills": "Install or create skills.",
+        "/subagents": "Install or create sub-agents.",
         "/hooks": "Manage lifecycle hooks.",
-        "/plugins": "Install, enable, or disable plugins.",
-        "/init": "Initialize .turtles/config.json.",
-        "/docs": "Generate TURTLES.md project rules.",
+        "/plugins": "Install, create, enable, or disable plugins.",
+        "/init": "Create .turtles/config.json and TURTLE.md.",
+        "/docs": "Create a custom instruction Markdown file with the active model.",
+        "/doc": "Alias for /docs.",
         "/code-review": "Run local code review heuristics.",
         "/security": "Scan for secrets and risky patterns.",
-        "/mcp": "List or add MCP servers. GitHub MCP is enabled by default.",
+        "/mcp": "List, add, or check MCP servers. GitHub MCP is enabled by default.",
         "/mcp-suggestion": "Suggest relevant MCP servers.",
         "/docker": "Audit Dockerfile and Compose files.",
         "/api": "Suggest relevant APIs.",
         "/AI": "Suggest open/free AI providers and models.",
-        "/github": "Run GitHub-oriented git/gh operations.",
+        "/github": "Choose GitHub-oriented git/gh/MCP actions.",
         "/suggest-skills": "Suggest skills for this project.",
         "/suggest-plugins": "Suggest plugins for this project.",
         "/suggest-subagents": "Suggest sub-agents for this project.",
@@ -397,19 +577,22 @@ def handle_help(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCo
 
 
 def handle_ai_detect(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    estimate, findings = ai_detect(root)
-    print_findings(findings, f"AI Detection Estimate: {estimate}%", get_mode(config.mode))
+    mode = get_mode(config.mode)
+    estimate, findings = run_with_animation("Running AI marker scan", mode, lambda: ai_detect(root))
+    print_findings(findings, f"AI Detection Estimate: {estimate}%", mode)
     return config
 
 
 def handle_context(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    cache = load_cache(root)
+    mode = get_mode(config.mode)
+    cache = run_with_animation("Estimating context usage", mode, lambda: load_cache(root))
     segments = args if args else cache.context_segments
-    usage = context_usage(segments)
-    body = "\n".join(f"{key}: {value}" for key, value in usage.items())
+    provider = PROVIDERS.get(config.provider.provider)
+    window = provider.context_window if provider else 128_000
+    usage = context_usage(segments, window=window, model=config.provider.model or "not logged in")
+    render_context_usage(usage, mode)
     if cache.recent_commands:
-        body += "\n\nRecent commands:\n" + "\n".join(cache.recent_commands[-8:])
-    panel("Context usage estimate", body, get_mode(config.mode))
+        panel("Recent commands", "\n".join(cache.recent_commands[-8:]), mode)
     return config
 
 
@@ -424,17 +607,22 @@ def handle_mode(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCo
             config.mode = mode.key
             save_config(config, root)
             status(f"{mode.name} mode active: {mode.focus}", mode)
+            console.print()
+            from .ui import build_mascot
+
+            console.print(build_mascot(mode))
             return config
     return config
 
 
 def handle_bash(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     command = " ".join(args) or Prompt.ask("bash")
-    bash_probe = subprocess.run(["bash", "-lc", "printf ok"], cwd=root, text=True, capture_output=True, check=False)
-    if bash_probe.returncode == 0:
-        result = subprocess.run(["bash", "-lc", command], cwd=root, text=True, capture_output=True, check=False)
-    else:
-        result = subprocess.run(command, cwd=root, text=True, capture_output=True, shell=True, check=False)
+    with processing_animation("Running shell command", get_mode(config.mode)):
+        bash_probe = subprocess.run(["bash", "-lc", "printf ok"], cwd=root, text=True, capture_output=True, check=False)
+        if bash_probe.returncode == 0:
+            result = subprocess.run(["bash", "-lc", command], cwd=root, text=True, capture_output=True, check=False)
+        else:
+            result = subprocess.run(command, cwd=root, text=True, capture_output=True, shell=True, check=False)
     output = result.stdout or result.stderr or "No output."
     panel(f"bash exit {result.returncode}", output.strip(), get_mode(config.mode), border_style="green" if result.returncode == 0 else "red")
     return config
@@ -443,9 +631,10 @@ def handle_bash(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCo
 def handle_web_search(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     query = " ".join(args) or Prompt.ask("Search query")
     url = f"https://duckduckgo.com/html/?q={urllib.parse.quote_plus(query)}"
-    with httpx.Client(timeout=10.0, follow_redirects=True, headers={"User-Agent": "turtles-cli/0.1"}) as client:
-        response = client.get(url)
-        response.raise_for_status()
+    with processing_animation("Searching web", get_mode(config.mode)):
+        with httpx.Client(timeout=10.0, follow_redirects=True, headers={"User-Agent": "turtles-cli/0.1"}) as client:
+            response = client.get(url)
+            response.raise_for_status()
     matches = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', response.text, flags=re.S)
     lines: list[str] = []
     for raw_url, raw_title in matches[:5]:
@@ -458,9 +647,44 @@ def handle_web_search(args: list[str], root: Path, config: TurtlesConfig) -> Tur
     return config
 
 
+def ai_or_error(config: TurtlesConfig, mode: TurtleMode, system: str, prompt: str) -> str:
+    if not provider_ready(config):
+        shell_problem("No AI provider/model is configured. Run /login, then /test-model.")
+        return ""
+    try:
+        with processing_animation(
+            "AI processing",
+            mode,
+            phases=["checking active provider", "preparing request", "waiting for model", "reading response"],
+        ):
+            response = complete_text(config, system, prompt)
+        status(f"Used {response.provider} / {response.model}.", mode, style="green")
+        return response.text
+    except LLMError as exc:
+        shell_problem(f"AI provider failed. {exc}")
+        return ""
+
+
+def handle_user_prompt(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
+    prompt = " ".join(args)
+    mode = get_mode(config.mode)
+    body = ai_or_error(
+        config,
+        mode,
+        f"You are Turtles CLI in {mode.name} mode. Help like a pragmatic coding assistant. Keep answers concise and actionable.",
+        prompt,
+    )
+    if body:
+        markdown_panel("Assistant", body, mode)
+    return config
+
+
 HANDLERS: dict[str, CommandHandler] = {
     "/login": handle_login,
+    "/logout": handle_logout,
     "/models": handle_models,
+    "/test-model": handle_test_model,
+    "/test-ai": handle_test_model,
     "/provider": handle_provider,
     "/customize-cli": handle_customize,
     "/skills": lambda args, root, config: handle_simple_registry("skills", args, root, config),
@@ -469,6 +693,7 @@ HANDLERS: dict[str, CommandHandler] = {
     "/plugins": handle_plugins,
     "/init": handle_init,
     "/docs": handle_docs,
+    "/doc": handle_docs,
     "/code-review": handle_code_review,
     "/security": handle_security,
     "/mcp": handle_mcp,
@@ -501,6 +726,8 @@ def dispatch(line: str, root: Path, config: TurtlesConfig) -> tuple[bool, Turtle
         return True, config
     if stripped in {"/exit", "/quit"}:
         return False, config
+    if not stripped.startswith("/"):
+        return True, handle_user_prompt([stripped], root, config)
     command, *args = stripped.split()
     handler = HANDLERS.get(command)
     if handler is None:
