@@ -18,7 +18,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from .mascots import mascot_frame
+from .mascots import mascot_frame, mascot_rich_lines
 from .modes import MODES, TurtleMode
 
 
@@ -81,8 +81,8 @@ def build_logo(active_mask: int | None = None, subtitle: str | None = None) -> T
 def build_mascot(mode: TurtleMode, frame: int = 0, activity: str = "idle") -> Table:
     mascot = Table.grid(expand=False)
     mascot.add_column()
-    for line in mascot_frame(mode, frame, activity).splitlines():
-        mascot.add_row(Align.center(Text(line, style=f"bold {mode.color}")))
+    for text_line in mascot_rich_lines(mode, frame, activity):
+        mascot.add_row(Align.center(text_line))
     mascot.add_row(Align.center(Text(mode.name, style=f"bold {mode.color}")))
     mascot.add_row(Align.center(Text(mode.focus, style="dim")))
     return mascot
