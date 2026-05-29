@@ -4,6 +4,15 @@
 
 Turtles CLI is an interactive terminal tool that gets your repo ready before handing work off to AI coding assistants like Claude, Codex, or Gemini. It handles provider auth, model testing, context estimation, code review, security scanning, and asset scaffolding all from a single shell.
 
+<p align="center">
+  <img src="screenshots/screenshot-1.png" alt="Turtles CLI — Main Shell" width="48%" />
+  <img src="screenshots/screenshot-2.png" alt="Turtles CLI — Provider Login" width="48%" />
+</p>
+<p align="center">
+  <img src="screenshots/screenshot-3.png" alt="Turtles CLI — Code Review" width="48%" />
+  <img src="screenshots/screenshot-4.png" alt="Turtles CLI — Turtle Mode" width="48%" />
+</p>
+
 ---
 
 ## Contents
@@ -57,7 +66,7 @@ uv run --extra dev pytest
 Run the local server:
 
 ```bash
-uv run turtles-server --host 127.0.0.1 --port 8765
+uv run turtles-server --host <YOUR_HOST> --port 8765
 ```
 
 ---
@@ -250,7 +259,7 @@ On first run, `/turtle-mode` will prompt you for remote machine details:
 
 ```text
 Machine name: ec2-agent-1
-Host (IP or hostname): 54.123.45.67
+Host (IP or hostname): <YOUR_HOST_IP>
 SSH user: ubuntu
 SSH key path: ~/.ssh/my-key.pem
 SSH port: 22

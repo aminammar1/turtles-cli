@@ -19,6 +19,7 @@ help:
 	@echo "  make docker       Run Docker audit command"
 	@echo "  make ai-detect    Run AI-generated-code marker scan"
 	@echo "  make install-global Install the turtle command globally (editable mode)"
+	@echo "  make uninstall-global Uninstall the global turtle command"
 	@echo "  make docker-build   Build the Alpine-based Docker image"
 	@echo "  make docker-run     Run the interactive turtle CLI inside Docker"
 	@echo "  make clean          Remove local caches"
@@ -30,6 +31,9 @@ sync: install
 
 install-global:
 	$(UV) tool install --editable .
+
+uninstall-global:
+	$(UV) tool uninstall turtles-cli
 
 run:
 	$(UV) run turtle
