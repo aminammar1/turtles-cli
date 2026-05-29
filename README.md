@@ -209,20 +209,91 @@ stdio command: <your github mcp server command>
 
 ---
 
+## Turtle Mode
+
+> ⚠️ **Experimental** — Turtle Mode is an experimental multi-agent orchestration feature. **Test with simple, non-destructive prompts only.** The goal is to observe what happens when multiple AI code assistants work on the same project simultaneously.
+
+Turtle Mode connects to multiple machines (your local machine + remote EC2 instances), detects which code assistant CLIs are installed, sends the **same prompt** to two agents at the same time, streams both responses side-by-side, and then asks an AI to grade how they collaborated.
+
+### How It Works
+
+```
+/turtle-mode
+  │
+  ├─ 🔗 Phase 1: Connect
+  │    SSH into remote machines + local machine
+  │    Ping each connection to verify
+  │
+  ├─ 🔍 Phase 2: Detect Agents
+  │    Scan for: gemini-cli, claude-code, agy, codex, opencode
+  │    Pick which agent to use on each machine
+  │
+  ├─ 📝 Phase 3: Execute
+  │    Type one prompt → sent to both agents simultaneously
+  │    Responses stream back in a split-panel view
+  │
+  └─ 🏆 Phase 4: Grade
+       AI analyzes coherence, conflicts, complementarity
+       Collaboration score + recommendation
+```
+
+### Prerequisites
+
+- At least **2 machines** with a code assistant CLI installed (e.g. `gemini`, `claude`, `agy`, `codex`, or `opencode`)
+- SSH access to remote machines (key-based authentication recommended)
+- The **same project** checked out on all machines (via git clone)
+- A configured AI provider (`/login`) for the grading phase
+
+### Configuration
+
+On first run, `/turtle-mode` will prompt you for remote machine details:
+
+```text
+Machine name: ec2-agent-1
+Host (IP or hostname): 54.123.45.67
+SSH user: ubuntu
+SSH key path: ~/.ssh/my-key.pem
+SSH port: 22
+Remote project path: /home/ubuntu/my-project
+```
+
+Machine configurations are saved in `.turtles/config.json` and reused on subsequent runs.
+
+### Supported Code Assistants
+
+| Agent | Binary | One-Shot Command |
+|---|---|---|
+| Gemini CLI | `gemini` | `gemini -p "prompt"` |
+| Claude Code | `claude` | `claude -p "prompt"` |
+| Antigravity SDK | `agy` | `agy run "prompt"` |
+| Codex CLI | `codex` | `codex "prompt"` |
+| OpenCode | `opencode` | `opencode "prompt"` |
+
+### ⚠️ Important Warnings
+
+- **Start simple**: Use read-only prompts first (e.g. "explain main.py") before trying write operations
+- **Conflict risk**: Two agents editing the same files simultaneously **will** cause conflicts
+- **Not production-ready**: This is a research/experimentation tool to study multi-agent behavior
+- **Resource usage**: Running two AI agents simultaneously uses more API credits and compute
+
+---
+
 ## Project Structure
 
 ```
 turtles_cli/
-  main.py       # Typer entry point and shell loop
-  commands.py   # Slash commands
-  config.py     # Project config
-  llm.py        # Provider clients
-  providers.py  # Provider metadata
-  scaffold.py   # Skills, subagents, plugins
-  ui.py         # Rich terminal UI and animations
-  mascots.py    # Turtle mascot frames
-  audits.py     # Local scanners
-  server.py     # FastAPI server
+  main.py         # Typer entry point and shell loop
+  commands.py     # Slash commands
+  config.py       # Project config
+  llm.py          # Provider clients
+  providers.py    # Provider metadata
+  scaffold.py     # Skills, subagents, plugins
+  ui.py           # Rich terminal UI and animations
+  mascots.py      # Turtle mascot frames
+  audits.py       # Local scanners
+  remote.py       # SSH connection manager for turtle-mode
+  turtle_mode.py  # Multi-agent orchestration
+  server.py       # FastAPI server
 
 tests/
 ```

@@ -40,6 +40,7 @@ class TurtlesConfig:
     subagents: list[str] = field(default_factory=list)
     plugins: dict[str, bool] = field(default_factory=dict)
     hooks: dict[str, str] = field(default_factory=dict)
+    remote_machines: list[dict[str, Any]] = field(default_factory=list)
     mcp_servers: dict[str, dict[str, Any]] = field(
         default_factory=lambda: {
             "github": {
@@ -80,6 +81,7 @@ def load_config(root: Path | None = None) -> TurtlesConfig:
         subagents=list(data.get("subagents", [])),
         plugins=dict(data.get("plugins", {})),
         hooks=dict(data.get("hooks", {})),
+        remote_machines=list(data.get("remote_machines", [])),
         mcp_servers=dict(data.get("mcp_servers", TurtlesConfig().mcp_servers)),
     )
 

@@ -18,12 +18,18 @@ help:
 	@echo "  make security     Run local security audit command"
 	@echo "  make docker       Run Docker audit command"
 	@echo "  make ai-detect    Run AI-generated-code marker scan"
-	@echo "  make clean        Remove local caches"
+	@echo "  make install-global Install the turtle command globally (editable mode)"
+	@echo "  make docker-build   Build the Alpine-based Docker image"
+	@echo "  make docker-run     Run the interactive turtle CLI inside Docker"
+	@echo "  make clean          Remove local caches"
 
 install:
 	$(UV) sync --extra dev
 
 sync: install
+
+install-global:
+	$(UV) tool install --editable .
 
 run:
 	$(UV) run turtle
@@ -53,6 +59,12 @@ docker:
 
 ai-detect:
 	$(UV) run turtle /ai-detect
+
+docker-build:
+	docker build -t turtles-cli .
+
+docker-run:
+	docker run -it -v $(shell pwd):/app turtles-cli
 
 clean:
 	$(UV) cache clean

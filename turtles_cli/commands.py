@@ -995,8 +995,9 @@ def handle_simulation(args: list[str], root: Path, config: TurtlesConfig) -> Tur
 
 
 def handle_turtle_mode(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    shell_problem("Turtle Mode orchestration is not implemented yet. No mock run was started.")
-    return config
+    from .turtle_mode import run_turtle_mode
+
+    return run_turtle_mode(args, root, config)
 
 
 def handle_help(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
@@ -1032,7 +1033,7 @@ def handle_help(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCo
         "/enhance-prompt": "Improve a prompt.",
         "/prompt-eval": "Score prompt quality.",
         "/simulation": "Grade a prompt scenario before running it.",
-        "/turtle-mode": "Future multi-agent orchestration stub.",
+        "/turtle-mode": "Multi-agent orchestration: run 2 code assistants on the same project across machines.",
         "/ai-detect": "Estimate AI-generated content markers.",
         "/context": "Estimate context window usage.",
         "/bash": "Run a shell command from the project root.",

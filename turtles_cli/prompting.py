@@ -95,7 +95,7 @@ COMMAND_DESCRIPTIONS = {
     "/enhance-prompt": "improve a prompt",
     "/prompt-eval": "score a prompt",
     "/simulation": "grade a scenario",
-    "/turtle-mode": "future multi-agent stub",
+    "/turtle-mode": "multi-agent orchestration across machines",
     "/help": "show help",
     "/ai-detect": "detect AI-generated markers",
     "/context": "show context/cache estimate",
