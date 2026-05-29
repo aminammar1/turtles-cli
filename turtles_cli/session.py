@@ -19,6 +19,8 @@ class SessionCache:
     last_model: str = ""
     recent_commands: list[str] = field(default_factory=list)
     context_segments: list[str] = field(default_factory=list)
+    project_context_key: str = ""
+    project_context: str = ""
 
 
 def cache_path(root: Path | None = None) -> Path:
@@ -40,6 +42,8 @@ def load_cache(root: Path | None = None) -> SessionCache:
         last_model=data.get("last_model", ""),
         recent_commands=list(data.get("recent_commands", [])),
         context_segments=list(data.get("context_segments", [])),
+        project_context_key=data.get("project_context_key", ""),
+        project_context=data.get("project_context", ""),
     )
 
 

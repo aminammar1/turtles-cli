@@ -15,18 +15,48 @@ from rich import box
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from .audits import Finding, ai_detect, code_review, context_usage, docker_audit, security_audit
-from .config import ProviderConfig, TurtlesConfig, init_project, is_logged_in, load_config, save_config
+from .audits import Finding, ai_detect, code_review, context_usage, docker_audit, iter_project_files, safe_read, security_audit
+from .config import ProviderConfig, TurtlesConfig, config_dir, init_project, is_logged_in, load_config, save_config
 from .llm import LLMError, complete_text, provider_ready
 from .modes import TurtleMode, get_mode
-from .prompting import choose_from_keyboard
+from .prompting import ask_project_text, choose_from_keyboard
 from .providers import PROVIDERS
 from .scaffold import create_plugin, create_skill, create_subagent
-from .session import load_cache
-from .ui import console, markdown_panel, masked_prompt, panel, processing_animation, render_context_usage, shell_problem, status
+from .session import load_cache, save_cache
+from .ui import (
+    choose_mode,
+    command_pick_animation,
+    console,
+    markdown_panel,
+    masked_prompt,
+    panel,
+    processing_animation,
+    render_context_usage,
+    shell_problem,
+    status,
+)
 
 
 CommandHandler = Callable[[list[str], Path, TurtlesConfig], TurtlesConfig]
+MAX_TOOL_OUTPUT = 12_000
+MAX_PROJECT_READ_CHARS = 22_000
+MAX_PROJECT_READ_FILES = 18
+INSTRUCTION_FILES = (
+    "TURTLE.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    ".cursorrules",
+    ".cursor/rules",
+    ".github/copilot-instructions.md",
+)
+MENTION_RE = re.compile(r"(?<!\w)@([A-Za-z0-9._][A-Za-z0-9._/\-]*)")
+FAKE_TOOL_RE = re.compile(
+    r"(?is)<\s*tool_(?:call|use)[^>]*>.*?(?:</\s*tool_(?:call|use)\s*>)?|"
+    r"\b(?:bash|shell)\s+(?:execute|tool|command)\s*:",
+)
+FENCED_CODE_RE = re.compile(r"```")
+JSON_OBJECT_RE = re.compile(r"^\s*[\[{].*[\]}]\s*$", re.S)
 
 
 def require_login(config: TurtlesConfig) -> bool:
@@ -34,6 +64,218 @@ def require_login(config: TurtlesConfig) -> bool:
         return True
     console.print("[yellow]Run /login first. Provider-backed commands unlock after project-scoped credentials are configured.[/yellow]")
     return False
+
+
+def require_ai(config: TurtlesConfig) -> bool:
+    if provider_ready(config):
+        return True
+    shell_problem("This command needs a configured AI provider and model. Run /login, then /test-model.")
+    return False
+
+
+def truncate_text(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"\n... truncated {len(text) - limit} chars ..."
+
+
+def project_relative_path(root: Path, value: str) -> Path | None:
+    candidate = Path(value)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    resolved = (root / candidate).resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return resolved
+
+
+def command_path_arg(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value[1:] if value.startswith("@") else value
+
+
+def extract_file_mentions(text: str) -> list[str]:
+    seen: set[str] = set()
+    mentions: list[str] = []
+    for match in MENTION_RE.finditer(text):
+        mention = match.group(1).rstrip(".,:;)")
+        if mention not in seen:
+            seen.add(mention)
+            mentions.append(mention)
+    return mentions
+
+
+def bash_tool_snapshot(root: Path) -> str:
+    command = "printf 'pwd: '; pwd; printf '\\nfiles:\\n'; (rg --files 2>/dev/null || find . -type f | sed 's#^./##') | head -60"
+    try:
+        result = subprocess.run(["bash", "-lc", command], cwd=root, text=True, capture_output=True, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"bash tool failed: {exc}"
+    output = result.stdout or result.stderr or "No bash output."
+    return truncate_text(output, 4_000)
+
+
+def instruction_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for name in INSTRUCTION_FILES:
+        path = root / name
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            files.extend(sorted(child for child in path.rglob("*") if child.is_file()))
+    return files
+
+
+def project_read_context(root: Path) -> str:
+    instructions = instruction_files(root)
+    all_files = iter_project_files(root)
+    instruction_set = {path.resolve() for path in instructions}
+    project_files = [path for path in all_files if path.resolve() not in instruction_set]
+    ordered_files = [*instructions, *project_files] if instructions else project_files
+    if not ordered_files:
+        return "read phase 1: no readable project text files found."
+
+    sections: list[str] = []
+    if instructions:
+        sections.append(
+            "read phase 1: instruction files found and read first:\n"
+            + "\n".join(str(path.relative_to(root)) for path in instructions)
+        )
+        sections.append("read phase 2: bounded project text-file reads after instructions:")
+    else:
+        sections.append("read phase 1: no instruction files found; bounded read of project text files:")
+
+    remaining = MAX_PROJECT_READ_CHARS
+    emitted = 0
+    for path in ordered_files:
+        if emitted >= MAX_PROJECT_READ_FILES or remaining <= 0:
+            break
+        relative = path.relative_to(root)
+        text = safe_read(path).strip()
+        if not text:
+            continue
+        budget = min(3_000, remaining)
+        excerpt = truncate_text(text, budget)
+        sections.append(f"--- {relative} ---\n{excerpt}")
+        remaining -= len(excerpt)
+        emitted += 1
+
+    omitted = len(ordered_files) - emitted
+    if omitted > 0:
+        sections.append(f"... omitted {omitted} additional readable project files due to context budget ...")
+    return "\n\n".join(sections)
+
+
+def project_context_key(root: Path) -> str:
+    parts: list[str] = []
+    for path in [*instruction_files(root), *iter_project_files(root)[:MAX_PROJECT_READ_FILES]]:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        parts.append(f"{path.relative_to(root)}:{stat.st_mtime_ns}:{stat.st_size}")
+    return "|".join(parts)
+
+
+def cached_project_read_context(root: Path) -> str:
+    key = project_context_key(root)
+    cache = load_cache(root)
+    if cache.project_context_key == key and cache.project_context:
+        return "read phase 0: reused cached project file context.\n\n" + cache.project_context
+    body = project_read_context(root)
+    cache.project_context_key = key
+    cache.project_context = body
+    save_cache(cache, root)
+    return body
+
+
+def mentioned_file_context(root: Path, prompt: str) -> str:
+    sections: list[str] = []
+    for mention in extract_file_mentions(prompt):
+        path = project_relative_path(root, mention)
+        if path is None:
+            sections.append(f"@{mention}: rejected; path must stay inside the project.")
+            continue
+        if not path.exists():
+            sections.append(f"@{mention}: not found.")
+            continue
+        relative = path.relative_to(root)
+        if path.is_dir():
+            files = [str(child.relative_to(root)) for child in path.rglob("*") if child.is_file()]
+            sections.append(f"@{mention} directory listing:\n" + "\n".join(files[:80]))
+            continue
+        if not path.is_file():
+            sections.append(f"@{mention}: not a regular file.")
+            continue
+        text = safe_read(path)
+        sections.append(f"@{relative} file contents:\n{truncate_text(text, 8_000)}")
+    return "\n\n".join(sections) if sections else "No @file references were provided."
+
+
+def ai_tool_context(root: Path, prompt: str, config: TurtlesConfig) -> str:
+    return (
+        "Turtles CLI local evidence follows. Read evidence is primary. Scanner output, if present in the user task, "
+        "is secondary and may be wrong. The model did not execute tools directly.\n\n"
+        f"read tool evidence:\n{cached_project_read_context(root)}\n\n"
+        f"@file reader:\n{mentioned_file_context(root, prompt)}\n\n"
+        f"project signal:\n{project_signal_context(root, config)}\n\n"
+        f"bash snapshot:\n{bash_tool_snapshot(root)}"
+    )
+
+
+def finding_file_evidence(root: Path, findings: list[Finding], *, radius: int = 2, max_files: int = 6) -> str:
+    if not findings:
+        return "No finding-linked file snippets."
+    by_path: dict[str, list[int]] = {}
+    for finding in findings:
+        if finding.path == ".":
+            continue
+        by_path.setdefault(finding.path, [])
+        if finding.line not in by_path[finding.path]:
+            by_path[finding.path].append(finding.line)
+    sections: list[str] = []
+    for relative, line_numbers in list(sorted(by_path.items()))[:max_files]:
+        path = project_relative_path(root, relative)
+        if path is None or not path.is_file():
+            continue
+        lines = safe_read(path).splitlines()
+        snippets: list[str] = []
+        for line_number in sorted(line_numbers)[:4]:
+            start = max(1, line_number - radius)
+            end = min(len(lines), line_number + radius)
+            for current in range(start, end + 1):
+                marker = ">" if current == line_number else " "
+                snippets.append(f"{marker} {current}: {lines[current - 1]}")
+        if snippets:
+            sections.append(f"{relative}:\n" + "\n".join(snippets))
+    return "\n\n".join(sections) if sections else "No readable finding-linked file snippets."
+
+
+def finding_file_reads(root: Path, findings: list[Finding], *, max_files: int = 5, max_chars: int = 18_000) -> str:
+    paths: list[str] = []
+    for finding in findings:
+        if finding.path == "." or finding.path in paths:
+            continue
+        paths.append(finding.path)
+    if not paths:
+        return "No finding-linked files to read."
+
+    sections: list[str] = []
+    remaining = max_chars
+    for relative in paths[:max_files]:
+        path = project_relative_path(root, relative)
+        if path is None or not path.is_file() or remaining <= 0:
+            continue
+        text = safe_read(path).strip()
+        if not text:
+            continue
+        excerpt = truncate_text(text, min(4_000, remaining))
+        sections.append(f"--- {relative} ---\n{excerpt}")
+        remaining -= len(excerpt)
+    return "\n\n".join(sections) if sections else "No readable finding-linked files."
 
 
 def print_findings(findings: list[Finding], title: str, mode: TurtleMode) -> None:
@@ -47,6 +289,108 @@ def print_findings(findings: list[Finding], title: str, mode: TurtleMode) -> Non
     if not findings:
         table.add_row("ok", ".", "0", "No findings from the local scanner.")
     console.print(table)
+
+
+def findings_prompt(kind: str, findings: list[Finding]) -> str:
+    if not findings:
+        return f"Local {kind} scanner returned no findings."
+    grouped: dict[str, list[Finding]] = {}
+    seen: set[tuple[str, int, str]] = set()
+    for finding in findings:
+        key = (finding.path, finding.line, finding.message)
+        if key in seen:
+            continue
+        seen.add(key)
+        grouped.setdefault(finding.path, []).append(finding)
+
+    lines = [f"Local {kind} scanner findings ({len(seen)} unique findings across {len(grouped)} files):"]
+    emitted = 0
+    for path, path_findings in sorted(grouped.items()):
+        if emitted >= 80:
+            break
+        lines.append(f"- {path}")
+        for finding in path_findings[:5]:
+            if emitted >= 80:
+                break
+            lines.append(f"  - line {finding.line} [{finding.severity}]: {finding.message}")
+            emitted += 1
+        if len(path_findings) > 5:
+            lines.append(f"  - ... {len(path_findings) - 5} more in this file ...")
+    if len(seen) > emitted:
+        lines.append(f"- ... {len(seen) - emitted} additional unique findings omitted ...")
+    return "\n".join(lines)
+
+
+def scanner_prompt(root: Path, kind: str, findings: list[Finding]) -> str:
+    return (
+        "Read/instruction-file evidence is primary. Local scanner output is secondary and not ground truth. "
+        "Treat low/info findings as triage leads. Only call something confirmed when the file evidence supports it.\n\n"
+        f"Project read context:\n{cached_project_read_context(root)}\n\n"
+        f"{findings_prompt(kind, findings)}\n\n"
+        f"Finding-linked snippets:\n{finding_file_evidence(root, findings)}\n\n"
+        f"Finding-linked file reads:\n{finding_file_reads(root, findings)}"
+    )
+
+
+def tool_output_prompt(kind: str, output: str, *, exit_code: int | None = None) -> str:
+    lines = [f"Local tool result: {kind}"]
+    if exit_code is not None:
+        lines.append(f"Exit code: {exit_code}")
+    lines.append("Output:")
+    lines.append(truncate_text(output.strip() or "No output.", 10_000))
+    return "\n".join(lines)
+
+
+def render_local_result(title: str, output: str, mode: TurtleMode, *, exit_code: int | None = None) -> None:
+    body = tool_output_prompt(title, output, exit_code=exit_code)
+    border = "green" if exit_code in {None, 0} else "red"
+    panel(title, body, mode, border_style=border)
+
+
+def response_has_fake_tool_call(text: str) -> bool:
+    return bool(FAKE_TOOL_RE.search(text))
+
+
+def response_is_malformed(text: str, contract: str) -> bool:
+    lowered = text.lower()
+    if response_has_fake_tool_call(text):
+        return True
+    if contract == "plain_prompt":
+        return bool(FENCED_CODE_RE.search(text) or JSON_OBJECT_RE.match(text) or "<tool" in lowered)
+    if contract == "prompt_eval":
+        return "score" not in lowered or bool(FENCED_CODE_RE.search(text) or JSON_OBJECT_RE.match(text))
+    if contract == "markdown_doc":
+        return bool(JSON_OBJECT_RE.match(text) or "<tool" in lowered)
+    return False
+
+
+def clean_ai_response(text: str) -> str:
+    cleaned = FAKE_TOOL_RE.sub("", text).strip()
+    cleaned = re.sub(r"(?im)^\s*(I'll|I will|Let me)\s+(inspect|analyze|read|run|check).*$", "", cleaned)
+    return cleaned.strip()
+
+
+def init_template_body(mode: TurtleMode, *, source: str) -> str:
+    return f"""# TURTLE.md
+
+> Source: {source}
+
+## Project Instructions
+- Work only inside this repository unless the user explicitly says otherwise.
+- Keep secrets, tokens, and local runtime files out of commits.
+- Prefer focused edits and project-local tests.
+- Treat scanner output as leads; verify against file evidence before reporting defects.
+- Use `/code-review`, `/security`, `/docker`, and `/context` before large assistant tasks.
+
+## Active Mode
+- {mode.name}: {mode.focus}
+
+## Assistant Files
+- Claude: `CLAUDE.md`
+- Codex: `AGENTS.md`
+- Gemini: `GEMINI.md`
+- Turtles CLI: `TURTLE.md`
+"""
 
 
 def run_with_animation(message: str, mode: TurtleMode, action: Callable[[], object]) -> object:
@@ -145,7 +489,11 @@ def handle_test_model(args: list[str], root: Path, config: TurtlesConfig) -> Tur
     mode = get_mode(config.mode)
     if not require_login(config):
         return config
-    prompt = "Reply with one short sentence confirming model connectivity."
+    prompt = (
+        "Reply with one short sentence confirming model connectivity. "
+        "Mention that Turtles CLI supplied local bash/read tool evidence.\n\n"
+        f"{ai_tool_context(root, 'connectivity smoke test', config)}"
+    )
     try:
         with processing_animation(
             "Testing model connectivity",
@@ -154,7 +502,7 @@ def handle_test_model(args: list[str], root: Path, config: TurtlesConfig) -> Tur
         ):
             response = complete_text(
                 config,
-                "You are a connectivity test endpoint. Keep the response short.",
+                "You are a connectivity test endpoint. Keep the response short. You cannot run shell commands directly; rely on the provided local tool evidence.",
                 prompt,
                 timeout=20.0,
             )
@@ -206,7 +554,7 @@ def handle_simple_registry(kind: str, args: list[str], root: Path, config: Turtl
         collection.append(str(result.path.relative_to(root)))
         save_config(config, root)
         created = [str(path.relative_to(root)) for path in result.paths] if result.paths else [str(result.path.relative_to(root))]
-        status(f"Created {result.kind}: " + ", ".join(created), mode)
+        status(f"Created local scaffold template for {result.kind}: " + ", ".join(created), mode)
     return config
 
 
@@ -229,7 +577,7 @@ def handle_plugins(args: list[str], root: Path, config: TurtlesConfig) -> Turtle
         config.plugins[str(result.path.parent.parent.relative_to(root))] = True
         save_config(config, root)
         created = [str(path.relative_to(root)) for path in result.paths] if result.paths else [str(result.path.relative_to(root))]
-        status("Created plugin: " + ", ".join(created), get_mode(config.mode))
+        status("Created local scaffold template for plugin: " + ", ".join(created), get_mode(config.mode))
     else:
         name = Prompt.ask("Plugin name")
         config.plugins[name] = action == "enable"
@@ -257,46 +605,48 @@ def handle_hooks(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesC
 def handle_init(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     mode = get_mode(config.mode)
     target = root / "TURTLE.md"
-    body = f"""# TURTLE.md
+    source = "local Turtles CLI init template; no AI provider/model was used"
+    body = init_template_body(mode, source=source)
+    if provider_ready(config):
+        generated = ai_or_error(
+            config,
+            mode,
+        "Create a TURTLE.md project instruction file for a coding assistant. Return only Markdown for TURTLE.md. Do not claim to have run commands, inspected files beyond the supplied evidence, or verified anything not present in the evidence. Include a short Source line naming the active provider/model.",
+            f"Project root: {root.name}\nMode: {mode.name} - {mode.focus}\n{project_signal_context(root, config)}",
+            root=root,
+            output_contract="markdown_doc",
+        )
+        if generated:
+            source = "active AI provider/model via Turtles CLI"
+            body = generated.rstrip() + "\n"
 
-## Project Instructions
-- Work only inside this repository unless the user explicitly says otherwise.
-- Keep secrets, tokens, and local runtime files out of commits.
-- Prefer focused edits and project-local tests.
-- Use `/code-review`, `/security`, `/docker`, and `/context` before large assistant tasks.
-
-## Active Mode
-- {mode.name}: {mode.focus}
-
-## Assistant Files
-- Claude: `CLAUDE.md`
-- Codex: `AGENTS.md`
-- Gemini: `GEMINI.md`
-- Turtles CLI: `TURTLE.md`
-"""
     def write_files() -> None:
         init_project(root)
         target.write_text(body, encoding="utf-8")
 
     run_with_animation("Initializing project instructions", mode, write_files)
-    status(f"Initialized .turtles/config.json and {target.name}", mode)
+    status(f"Initialized .turtles/config.json and {target.name} using {source}.", mode)
     return load_config(root)
 
 
 def handle_docs(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     mode = get_mode(config.mode)
+    if not require_ai(config):
+        return config
     filename = args[0] if args else Prompt.ask("Instruction filename", default="backend.md")
     if Path(filename).is_absolute() or ".." in Path(filename).parts:
         shell_problem("Docs filename must stay inside the project root.")
         return config
     if not filename.endswith(".md"):
         filename = f"{filename}.md"
-    goal = " ".join(args[1:]) if len(args) > 1 else Prompt.ask("What should this instruction file cover?")
+    goal = " ".join(args[1:]) if len(args) > 1 else ask_project_text(root, "What should this instruction file cover?")
     body = ai_or_error(
         config,
         mode,
-        "Create a concise project instruction Markdown file for a coding assistant. Return only Markdown.",
+        "Create a concise project instruction Markdown file for a coding assistant. Return only Markdown for that instruction file. Do not include implementation code unless the user explicitly requested code examples. Do not claim to have checked or verified anything beyond the supplied evidence.",
         f"Filename: {filename}\nProject root: {root.name}\nRequested content: {goal}",
+        root=root,
+        output_contract="markdown_doc",
     )
     if not body:
         return config
@@ -304,28 +654,50 @@ def handle_docs(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCo
     with processing_animation(f"Writing {filename}", mode):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body.rstrip() + "\n", encoding="utf-8")
-    status(f"Wrote {target.relative_to(root)}", mode)
+    status(f"Wrote AI-generated instruction file {target.relative_to(root)}", mode)
     return config
 
 
 def handle_code_review(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    target = args[0] if args else None
+    target = command_path_arg(args[0] if args else None)
     mode = get_mode(config.mode)
+    if not require_ai(config):
+        return config
     findings = run_with_animation("Running code review", mode, lambda: code_review(root, target))
-    print_findings(findings, "Code Review", mode)
+    summary = scanner_prompt(root, "code review", findings)
+    body = ai_or_error(
+        config,
+        mode,
+        "Create one consolidated code-review report from the scanner leads and finding-linked file reads. Read the file evidence before conclusions. Do not convert low-confidence scanner leads into defects. If evidence does not confirm a bug, say it is unconfirmed or omit it. Prioritize real behavioral risks and include concrete verification commands. Do not print raw scanner tables.",
+        summary,
+        root=root,
+    )
+    if body:
+        markdown_panel("Code review", body, mode)
     return config
 
 
 def handle_security(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    target = args[0] if args else None
+    target = command_path_arg(args[0] if args else None)
     mode = get_mode(config.mode)
+    if not require_ai(config):
+        return config
     findings = run_with_animation("Running security audit", mode, lambda: security_audit(root, target))
-    print_findings(findings, "Security Audit", mode)
+    summary = scanner_prompt(root, "security audit", findings)
+    body = ai_or_error(
+        config,
+        mode,
+        "Create one consolidated security report from the scanner leads and finding-linked file reads. Read the file evidence before conclusions. Separate confirmed risks from likely false positives. Do not report a secret unless the evidence looks like a real credential rather than placeholder text, docs, or tests. Include concrete fixes. Do not print raw scanner tables.",
+        summary,
+        root=root,
+    )
+    if body:
+        markdown_panel("Security audit", body, mode)
     return config
 
 
 def handle_mcp(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    action = args[0] if args else choose_from_keyboard("MCP action", ["list", "check-github", "add-url", "add-stdio"], default="list")
+    action = args[0] if args else choose_from_keyboard("MCP action", ["list", "setup-github", "check-github", "add-url", "add-stdio"], default="list")
     if action == "list":
         table = Table(title="MCP Servers", box=box.SIMPLE_HEAVY)
         table.add_column("Name")
@@ -345,18 +717,75 @@ def handle_mcp(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCon
         command = Prompt.ask("stdio command")
         config.mcp_servers[name] = {"enabled": True, "transport": "stdio", "command": command, "scope": "project"}
         save_config(config, root)
+    elif action in {"setup-github", "github-setup"}:
+        mode = get_mode(config.mode)
+        body = run_with_animation("Setting up GitHub MCP", mode, lambda: setup_github_mcp(root, config))
+        render_local_result("GitHub MCP setup", body, mode)
     elif action in {"check", "check-github", "github"}:
         mode = get_mode(config.mode)
-        body = run_with_animation("Checking GitHub MCP", mode, lambda: github_mcp_diagnostics(config))
-        panel("GitHub MCP", body, mode)
+        body = run_with_animation("Checking GitHub MCP", mode, lambda: github_mcp_diagnostics(config, root))
+        render_local_result("GitHub MCP diagnostics", body, mode)
     return config
 
 
-def github_mcp_diagnostics(config: TurtlesConfig) -> str:
+def github_mcp_wrapper(root: Path) -> Path:
+    return config_dir(root) / "github-mcp-server"
+
+
+def setup_github_mcp(root: Path, config: TurtlesConfig) -> str:
+    native = shutil.which("github-mcp-server")
+    docker = shutil.which("docker")
+    lines: list[str] = []
+    if native:
+        command = "github-mcp-server"
+        lines.append(f"using native github-mcp-server: {native}")
+    elif docker:
+        wrapper = github_mcp_wrapper(root)
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text(
+            """#!/usr/bin/env sh
+set -eu
+
+if [ -z "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+  export GITHUB_PERSONAL_ACCESS_TOKEN="$GITHUB_TOKEN"
+fi
+
+if [ -z "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ]; then
+  echo "Set GITHUB_TOKEN or GITHUB_PERSONAL_ACCESS_TOKEN before starting Turtles CLI." >&2
+  exit 1
+fi
+
+exec docker run -i --rm \\
+  -e GITHUB_PERSONAL_ACCESS_TOKEN \\
+  ghcr.io/github/github-mcp-server "$@"
+""",
+            encoding="utf-8",
+        )
+        os.chmod(wrapper, 0o700)
+        command = str(wrapper.relative_to(root))
+        lines.append(f"created docker wrapper: {command}")
+    else:
+        return "failed: install docker or github-mcp-server, then run /mcp setup-github again."
+
+    config.mcp_servers["github"] = {"enabled": True, "transport": "stdio", "command": command, "scope": "project"}
+    save_config(config, root)
+    lines.append("configured project MCP server: github")
+    lines.append(f"GITHUB_TOKEN set: {'yes' if os.environ.get('GITHUB_TOKEN') else 'no'}")
+    lines.append(f"GITHUB_PERSONAL_ACCESS_TOKEN set: {'yes' if os.environ.get('GITHUB_PERSONAL_ACCESS_TOKEN') else 'no'}")
+    if not os.environ.get("GITHUB_TOKEN") and not os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN"):
+        lines.append("next: export GITHUB_TOKEN=... in the terminal before starting turtles.")
+    lines.append("")
+    lines.append(github_mcp_diagnostics(config, root))
+    return "\n".join(lines)
+
+
+def github_mcp_diagnostics(config: TurtlesConfig, root: Path | None = None) -> str:
     server = config.mcp_servers.get("github", {})
     command = str(server.get("command") or "github-mcp-server")
-    executable = shlex.split(command)[0] if command else "github-mcp-server"
-    found = shutil.which(executable)
+    command_parts = shlex.split(command) if command else ["github-mcp-server"]
+    executable = command_parts[0]
+    candidate = (root / executable).resolve() if root and not Path(executable).is_absolute() else Path(executable)
+    found = str(candidate) if ("/" in executable or "\\" in executable) and candidate.exists() else shutil.which(executable)
     lines = [
         f"configured: {'yes' if server else 'no'}",
         f"enabled: {server.get('enabled', False)}",
@@ -364,10 +793,11 @@ def github_mcp_diagnostics(config: TurtlesConfig) -> str:
         f"command: {command}",
         f"found on PATH: {'yes - ' + found if found else 'no'}",
         f"GITHUB_TOKEN set: {'yes' if os.environ.get('GITHUB_TOKEN') else 'no'}",
+        f"GITHUB_PERSONAL_ACCESS_TOKEN set: {'yes' if os.environ.get('GITHUB_PERSONAL_ACCESS_TOKEN') else 'no'}",
     ]
     if found:
         try:
-            result = subprocess.run(shlex.split(command) + ["--help"], text=True, capture_output=True, check=False, timeout=5)
+            result = subprocess.run(command_parts + ["--help"], cwd=root, text=True, capture_output=True, check=False, timeout=5)
             output = (result.stdout or result.stderr).strip().splitlines()
             lines.append(f"help check exit: {result.returncode}")
             if output:
@@ -384,8 +814,9 @@ def handle_mcp_suggestion(args: list[str], root: Path, config: TurtlesConfig) ->
     body = ai_or_error(
         config,
         mode,
-        "Recommend concrete MCP servers for this repository. Avoid placeholders. Explain why each server is useful and how to verify it.",
+        "Recommend concrete MCP servers for this repository based only on supplied project evidence. Do not claim a server is installed, working, or verified unless the evidence says so. Avoid placeholders. Explain why each server is useful and give exact verification steps.",
         project_signal_context(root, config),
+        root=root,
     )
     if body:
         markdown_panel("MCP suggestions", body, mode)
@@ -394,8 +825,19 @@ def handle_mcp_suggestion(args: list[str], root: Path, config: TurtlesConfig) ->
 
 def handle_docker(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     mode = get_mode(config.mode)
+    if not require_ai(config):
+        return config
     findings = run_with_animation("Running Docker audit", mode, lambda: docker_audit(root))
-    print_findings(findings, "Docker Audit", mode)
+    summary = scanner_prompt(root, "docker audit", findings)
+    body = ai_or_error(
+        config,
+        mode,
+        "Create one consolidated Docker report from the local scanner evidence. De-duplicate repeated files/lines, separate confirmed risks from likely false positives, and include quick verification steps. Do not print raw scanner tables.",
+        summary,
+        root=root,
+    )
+    if body:
+        markdown_panel("Docker audit", body, mode)
     return config
 
 
@@ -404,8 +846,9 @@ def handle_api(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCon
     body = ai_or_error(
         config,
         mode,
-        "Suggest concrete APIs that would be useful for this repository. Avoid generic placeholders.",
+        "Suggest concrete APIs that could be useful for this repository based only on supplied project evidence. Do not claim an API is already integrated or verified unless the evidence says so. Avoid generic placeholders.",
         project_signal_context(root, config),
+        root=root,
     )
     if body:
         markdown_panel("API suggestions", body, mode)
@@ -417,8 +860,9 @@ def handle_ai(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConf
     body = ai_or_error(
         config,
         mode,
-        "Recommend AI provider/model options for this repository's workflow. Be concrete and avoid mock provider behavior.",
+        "Recommend AI provider/model options for this repository's workflow based only on supplied project evidence. Be concrete, avoid mock provider behavior, and do not claim compatibility was tested unless the evidence says so.",
         project_signal_context(root, config),
+        root=root,
     )
     if body:
         markdown_panel("AI options", body, mode)
@@ -426,7 +870,8 @@ def handle_ai(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConf
 
 
 def handle_github(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    choices = ["status", "branch", "commit", "push", "pr-create", "pr-list", "issue-list", "repo-view", "mcp-check"]
+    mode = get_mode(config.mode)
+    choices = ["status", "branch", "commit", "push", "pr-create", "pr-list", "issue-list", "repo-view", "mcp-setup", "mcp-check"]
     subcommand = args[0] if args else choose_from_keyboard("GitHub action", choices, default="status")
     commands: dict[str, list[str]] = {
         "status": ["git", "status", "--short"],
@@ -437,24 +882,27 @@ def handle_github(args: list[str], root: Path, config: TurtlesConfig) -> Turtles
         "repo-view": ["gh", "repo", "view"],
     }
     if subcommand == "mcp-check":
-        mode = get_mode(config.mode)
-        body = run_with_animation("Checking GitHub MCP", mode, lambda: github_mcp_diagnostics(config))
-        panel("GitHub MCP", body, mode)
+        body = run_with_animation("Checking GitHub MCP", mode, lambda: github_mcp_diagnostics(config, root))
+        render_local_result("GitHub MCP diagnostics", body, mode)
+        return config
+    if subcommand == "mcp-setup":
+        body = run_with_animation("Setting up GitHub MCP", mode, lambda: setup_github_mcp(root, config))
+        render_local_result("GitHub MCP setup", body, mode)
         return config
     if subcommand == "commit":
         message = " ".join(args[1:]) or Prompt.ask("Commit message")
         command = ["git", "add", "."]
-        with processing_animation("Creating git commit", get_mode(config.mode)):
+        with processing_animation("Creating git commit", mode):
             subprocess.run(command, cwd=root, check=False)
             result = subprocess.run(["git", "commit", "-m", message], cwd=root, text=True, capture_output=True, check=False)
     elif subcommand in {"pr", "pr-create"}:
-        with processing_animation("Creating GitHub PR", get_mode(config.mode)):
+        with processing_animation("Creating GitHub PR", mode):
             result = subprocess.run(["gh", "pr", "create", "--web"], cwd=root, text=True, capture_output=True, check=False)
     else:
-        with processing_animation(f"Running github {subcommand}", get_mode(config.mode)):
+        with processing_animation(f"Running github {subcommand}", mode):
             result = subprocess.run(commands.get(subcommand, ["git", subcommand]), cwd=root, text=True, capture_output=True, check=False)
     output = result.stdout or result.stderr or "No output."
-    panel(f"github {subcommand}", output.strip(), get_mode(config.mode))
+    render_local_result(f"github {subcommand}", output, mode, exit_code=result.returncode)
     return config
 
 
@@ -463,8 +911,9 @@ def handle_suggest(kind: str, args: list[str], root: Path, config: TurtlesConfig
     body = ai_or_error(
         config,
         mode,
-        f"Suggest concrete {kind} to create for this repository. Avoid mock names. Include the exact purpose for each.",
+        f"Suggest concrete {kind} to create for this repository based only on supplied project evidence. Avoid mock names. Include the exact purpose for each. Do not claim the {kind} already exist or were verified unless the evidence says so.",
         project_signal_context(root, config),
+        root=root,
     )
     if body:
         markdown_panel(f"Suggested {kind}", body, mode)
@@ -472,22 +921,36 @@ def handle_suggest(kind: str, args: list[str], root: Path, config: TurtlesConfig
 
 
 def handle_create_prompt(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    goal = Prompt.ask("Goal")
-    context = Prompt.ask("Context")
-    output = Prompt.ask("Desired output")
-    prompt = f"Goal: {goal}\n\nContext: {context}\n\nOutput: {output}\n\nConstraints:\n- Stay within the project folder.\n- State assumptions.\n- Include verification steps."
-    panel("Created prompt", prompt, get_mode(config.mode))
+    mode = get_mode(config.mode)
+    if not require_ai(config):
+        return config
+    goal = ask_project_text(root, "Goal")
+    context = ask_project_text(root, "Context")
+    output = ask_project_text(root, "Desired output")
+    prompt = f"Goal: {goal}\n\nContext: {context}\n\nOutput: {output}"
+    body = ai_or_error(
+        config,
+        mode,
+        "Create a strong coding-assistant prompt from these fields. Return a prompt only, written as plain Markdown text. Do not write implementation code, fenced code blocks, JSON, YAML, or tool calls unless the user's requested output explicitly asks for code. Include scope, constraints, verification, and expected output format.",
+        prompt,
+        root=root,
+        output_contract="plain_prompt",
+    )
+    if body:
+        markdown_panel("Created prompt", body, mode)
     return config
 
 
 def handle_enhance_prompt(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    prompt = " ".join(args) or Prompt.ask("Prompt")
+    prompt = " ".join(args) or ask_project_text(root, "Prompt")
     mode = get_mode(config.mode)
     body = ai_or_error(
         config,
         mode,
         "Enhance this prompt for a coding assistant. Return only the improved prompt with concise sections.",
         prompt,
+        root=root,
+        output_contract="plain_prompt",
     )
     if body:
         markdown_panel("Enhanced prompt", body, mode)
@@ -495,13 +958,15 @@ def handle_enhance_prompt(args: list[str], root: Path, config: TurtlesConfig) ->
 
 
 def handle_prompt_eval(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    prompt = " ".join(args) or Prompt.ask("Prompt")
+    prompt = " ".join(args) or ask_project_text(root, "Prompt")
     mode = get_mode(config.mode)
     body = ai_or_error(
         config,
         mode,
         "Evaluate the prompt for a coding assistant. Score clarity, specificity, safety, and output quality from 0-100. Include concise fixes.",
         prompt,
+        root=root,
+        output_contract="prompt_eval",
     )
     if body:
         markdown_panel("Prompt evaluation", body, mode)
@@ -509,15 +974,20 @@ def handle_prompt_eval(args: list[str], root: Path, config: TurtlesConfig) -> Tu
 
 
 def handle_simulation(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    console.print("[yellow]Important: a simulation scenario is just a prompt with optional skills, sub-agents, or plugins. It does not execute the work.[/yellow]")
-    prompt = " ".join(args) or Prompt.ask("Scenario prompt")
+    console.print(
+        "[yellow]Important: a simulation scenario is a prompt with optional skills, sub-agents, plugins, "
+        "and @path project file references. It does not execute or modify files; it passes local evidence "
+        "to the AI for a risk/plan/test assessment.[/yellow]"
+    )
+    prompt = " ".join(args) or ask_project_text(root, "Scenario prompt")
     code_involved = Confirm.ask("Does this scenario involve code?", default=True)
     mode = get_mode(config.mode)
     body = ai_or_error(
         config,
         mode,
-        "Simulate how a coding assistant would handle this scenario. Return a concise risk/plan/test assessment with a final readiness grade.",
+        "Simulate how a coding assistant would handle this scenario. Use the provided bash/read tool evidence, including @file contents. Return a concise risk/plan/test assessment with a final readiness grade.",
         f"Code involved: {code_involved}\n\nScenario:\n{prompt}",
+        root=root,
     )
     if body:
         markdown_panel("Simulation grade", body, mode)
@@ -578,8 +1048,18 @@ def handle_help(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesCo
 
 def handle_ai_detect(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
     mode = get_mode(config.mode)
-    estimate, findings = run_with_animation("Running AI marker scan", mode, lambda: ai_detect(root))
-    print_findings(findings, f"AI Detection Estimate: {estimate}%", mode)
+    if not require_ai(config):
+        return config
+    _estimate, findings = run_with_animation("Collecting AI-origin marker leads", mode, lambda: ai_detect(root))
+    body = ai_or_error(
+        config,
+        mode,
+        "Create one AI-origin marker review from read evidence and high-confidence marker leads. This is not a detector and must not output a percent-likelihood. Read instruction files and project files before conclusions. Use 'unknown' unless there is explicit provenance text such as generated-by markers. Docs mentioning AI tools, project instructions, placeholders, normal style, or long prose are not proof. List only files worth inspecting and explain why. Do not print raw scanner tables.",
+        scanner_prompt(root, "AI-origin marker leads", findings),
+        root=root,
+    )
+    if body:
+        markdown_panel("AI-origin marker review", body, mode)
     return config
 
 
@@ -597,41 +1077,32 @@ def handle_context(args: list[str], root: Path, config: TurtlesConfig) -> Turtle
 
 
 def handle_mode(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
-    from .modes import MODES
-
-    labels = [mode.name for mode in MODES.values()]
-    current = get_mode(config.mode)
-    selected = choose_from_keyboard("Mode", labels, default=current.name)
-    for mode in MODES.values():
-        if mode.name == selected:
-            config.mode = mode.key
-            save_config(config, root)
-            status(f"{mode.name} mode active: {mode.focus}", mode)
-            console.print()
-            from .ui import build_mascot
-
-            console.print(build_mascot(mode))
-            return config
+    mode = choose_mode(config.mode)
+    config.mode = mode.key
+    save_config(config, root)
+    status(f"{mode.name} mode active: {mode.focus}", mode)
     return config
 
 
 def handle_bash(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
+    mode = get_mode(config.mode)
     command = " ".join(args) or Prompt.ask("bash")
-    with processing_animation("Running shell command", get_mode(config.mode)):
+    with processing_animation("Running shell command", mode):
         bash_probe = subprocess.run(["bash", "-lc", "printf ok"], cwd=root, text=True, capture_output=True, check=False)
         if bash_probe.returncode == 0:
             result = subprocess.run(["bash", "-lc", command], cwd=root, text=True, capture_output=True, check=False)
         else:
             result = subprocess.run(command, cwd=root, text=True, capture_output=True, shell=True, check=False)
     output = result.stdout or result.stderr or "No output."
-    panel(f"bash exit {result.returncode}", output.strip(), get_mode(config.mode), border_style="green" if result.returncode == 0 else "red")
+    render_local_result(f"bash exit {result.returncode}", output, mode, exit_code=result.returncode)
     return config
 
 
 def handle_web_search(args: list[str], root: Path, config: TurtlesConfig) -> TurtlesConfig:
+    mode = get_mode(config.mode)
     query = " ".join(args) or Prompt.ask("Search query")
     url = f"https://duckduckgo.com/html/?q={urllib.parse.quote_plus(query)}"
-    with processing_animation("Searching web", get_mode(config.mode)):
+    with processing_animation("Searching web", mode):
         with httpx.Client(timeout=10.0, follow_redirects=True, headers={"User-Agent": "turtles-cli/0.1"}) as client:
             response = client.get(url)
             response.raise_for_status()
@@ -643,23 +1114,56 @@ def handle_web_search(args: list[str], root: Path, config: TurtlesConfig) -> Tur
         params = urllib.parse.parse_qs(parsed.query)
         destination = params.get("uddg", [html.unescape(raw_url)])[0]
         lines.append(f"{html.unescape(title)}\n{destination}")
-    panel("Web search", "\n\n".join(lines) if lines else "No results found.", get_mode(config.mode))
+    evidence = "\n\n".join(lines) if lines else "No results found."
+    render_local_result("Web search", f"Query: {query}\n\n{evidence}", mode)
     return config
 
 
-def ai_or_error(config: TurtlesConfig, mode: TurtleMode, system: str, prompt: str) -> str:
+def ai_or_error(
+    config: TurtlesConfig,
+    mode: TurtleMode,
+    system: str,
+    prompt: str,
+    *,
+    root: Path | None = None,
+    output_contract: str = "",
+) -> str:
     if not provider_ready(config):
         shell_problem("No AI provider/model is configured. Run /login, then /test-model.")
         return ""
+    enriched_prompt = prompt
+    enriched_system = system
+    if root is not None:
+        enriched_system = (
+            system
+            + "\n\nYou are inside Turtles CLI, but you do not have live tools. "
+            "The CLI already ran the local tools and supplied their evidence below. "
+            "Use the read tool evidence before asking about project files; instruction files are intentionally placed before project file reads. "
+            "Return the final user-facing answer only. Never emit XML/tool markup, '<tool_call>', 'bash execute:', "
+            "or text saying you will inspect/read/run/check files. If evidence is insufficient, state the missing evidence "
+            "as a short request for a specific /bash command or @file reference instead of pretending to run it."
+        )
+        enriched_prompt = f"{ai_tool_context(root, prompt, config)}\n\nUser task:\n{prompt}"
     try:
         with processing_animation(
             "AI processing",
             mode,
             phases=["checking active provider", "preparing request", "waiting for model", "reading response"],
         ):
-            response = complete_text(config, system, prompt)
+            response = complete_text(config, enriched_system, enriched_prompt)
+            if response_has_fake_tool_call(response.text) or (output_contract and response_is_malformed(response.text, output_contract)):
+                repair_prompt = (
+                    "Your previous answer violated the output contract. Rewrite it as a final answer only.\n"
+                    f"Output contract: {output_contract or 'final answer'}.\n"
+                    "Rules: no <tool_call>, no bash execute text, no promises to inspect files, no invented command output. "
+                    "For plain_prompt, return Markdown prose for a prompt, not implementation code, JSON, YAML, or fenced code. "
+                    "For prompt_eval, include a visible score and concise fixes, with no fenced code. "
+                    "Use only the evidence already provided. If more evidence is needed, request the exact /bash command or @file reference.\n\n"
+                    f"Previous answer:\n{response.text}\n\nOriginal task and evidence:\n{enriched_prompt}"
+                )
+                response = complete_text(config, enriched_system, repair_prompt)
         status(f"Used {response.provider} / {response.model}.", mode, style="green")
-        return response.text
+        return clean_ai_response(response.text)
     except LLMError as exc:
         shell_problem(f"AI provider failed. {exc}")
         return ""
@@ -673,6 +1177,7 @@ def handle_user_prompt(args: list[str], root: Path, config: TurtlesConfig) -> Tu
         mode,
         f"You are Turtles CLI in {mode.name} mode. Help like a pragmatic coding assistant. Keep answers concise and actionable.",
         prompt,
+        root=root,
     )
     if body:
         markdown_panel("Assistant", body, mode)
@@ -734,6 +1239,7 @@ def dispatch(line: str, root: Path, config: TurtlesConfig) -> tuple[bool, Turtle
         shell_problem(f"Unknown command: {command}. Run /help.")
         return True, config
     try:
+        command_pick_animation(command, get_mode(config.mode), enabled=config.display.show_animation)
         return True, handler(args, root, config)
     except Exception as exc:  # noqa: BLE001 - interactive CLI should recover gracefully.
         shell_problem(str(exc))

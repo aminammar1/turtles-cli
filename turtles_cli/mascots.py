@@ -302,11 +302,11 @@ _MIK_BANDANA_TOP = [
     "___KmmmmmmmmmmmmmmmmmmmmmmmmmK__",  # 7  tails LEFT
 ]
 _MIK_EYES = [
-    # Michelangelo — playful, mischievous, upward-arcing squint
-    # (laughing eyes). Brows raised, lower lids curve UP.
-    "____KmmmKKKKmmmmmmmmmKKKKmmmmmK_",  # 8  raised brow arc
+    # Michelangelo — orange mask, white comic eyes, raised grin energy.
+    # The eyes are intentionally blank/white like the reference art.
+    "____KmmmKKKKmmmmmmmmKKKKmmmmmmK_",  # 8  raised brow arc
     "___KmKKWWWWKmmmmmmmmKWWWWKKmmmK_",  # 9
-    "__KmmWWXXwWmmKKmmmmmWwXXWWmmmnnK",  # 10 sparkle in pupil
+    "__KmmWWWWWKmmKKmmmmmKWWWWWmmmnnK",  # 10 blank white eyes
     "____KmKWWWWKmmmmmmmmmKWWWWKmmnnK",  # 11 lower lid arcs UP
 ]
 _MIK_BANDANA_BOT = [
@@ -314,8 +314,8 @@ _MIK_BANDANA_BOT = [
     "____KmmmmmmmmmmmmmmmmmmmmmmmmK__",  # 13
 ]
 _MIK_MOUTH = [
-    "_____KGGGMMMMMMMMMMMMMMGGGGGK___",  # 16  big open grin lip
-    "_____KGGGMTTMTTMTTMTTMGGGGGGK___",  # 17  teeth with separators
+    "_____KGGMMMMMMMMMMMMMMMMGGGGK___",  # 16  wider black smile line
+    "_____KGGMTTTTTTTTTTTTMMGGGGK____",  # 17  big toothy grin
 ]
 
 _MIK_HEAD = (
@@ -328,14 +328,17 @@ _MIK_HEAD = (
     + _FACE_LOWER[2:]
 )
 
-# Nunchaku peeking over right shoulder
+# Nunchaku across the chest, with a second handle over the right shoulder.
 _MIK_OVERLAY: dict[tuple[int, int], str] = {
     (20, 26): "u", (20, 27): "U",
     (21, 26): "u", (21, 27): "U",
-    (22, 26): "c",                       # chain link
+    (22, 26): "c",
     (23, 26): "c",
-    (24, 26): "u", (24, 27): "U",
-    (25, 26): "u", (25, 27): "U",
+    (24, 5): "u", (24, 6): "U", (24, 23): "u", (24, 24): "U",
+    (25, 5): "u", (25, 6): "U", (25, 8): "c", (25, 9): "c", (25, 10): "c",
+    (25, 11): "c", (25, 12): "c", (25, 13): "c", (25, 14): "c", (25, 15): "c",
+    (25, 16): "c", (25, 17): "c", (25, 20): "c", (25, 23): "u", (25, 24): "U",
+    (26, 6): "u", (26, 7): "U", (26, 21): "c", (26, 22): "u", (26, 23): "U",
 }
 
 
@@ -479,6 +482,46 @@ def _render_rich(
     return lines
 
 
+def _pt_style(rgb: tuple[int, int, int], *, background: bool = False) -> str:
+    prefix = "bg:" if background else ""
+    return f"{prefix}#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+
+def _render_prompt_toolkit(
+    pixels: list[str],
+    bandana: tuple[int, int, int],
+    skin_delta: tuple[int, int, int],
+) -> list[tuple[str, str]]:
+    """Half-block render with prompt-toolkit-compatible RGB fragments."""
+    pw = len(pixels[0])
+    pad_l = (FRAME_WIDTH - pw) // 2
+    pad_r = FRAME_WIDTH - pw - pad_l
+    fragments: list[tuple[str, str]] = []
+
+    for i in range(0, len(pixels), 2):
+        top_row, bot_row = pixels[i], pixels[i + 1]
+        fragments.append(("", " " * pad_l))
+
+        for j in range(pw):
+            tc = _color_for(top_row[j], bandana, skin_delta)
+            bc = _color_for(bot_row[j], bandana, skin_delta)
+
+            if tc is None and bc is None:
+                fragments.append(("", " "))
+            elif tc is not None and bc is None:
+                fragments.append((_pt_style(tc), "▀"))
+            elif tc is None and bc is not None:
+                fragments.append((_pt_style(bc), "▄"))
+            elif tc == bc:
+                fragments.append((_pt_style(tc), "█"))  # type: ignore[arg-type]
+            else:
+                fragments.append((f"{_pt_style(tc)} {_pt_style(bc, background=True)}", "▀"))  # type: ignore[arg-type]
+
+        fragments.append(("", " " * pad_r + "\n"))
+
+    return fragments
+
+
 
 def frame_count(activity: str) -> int:
     return 3 if activity == "work" else 2
@@ -506,3 +549,14 @@ def mascot_rich_lines(
     bandana = BANDANA_COLORS.get(name, BANDANA_COLORS["leonardo"])
     skin_delta = SKIN_TINTS.get(name, (0, 0, 0))
     return _render_rich(pixels, bandana, skin_delta)
+
+
+def mascot_prompt_fragments(
+    mode: TurtleMode, frame: int = 0, activity: str = "idle"
+) -> list[tuple[str, str]]:
+    """Full-colour prompt-toolkit fragments for interactive selector previews."""
+    name = mode.key if mode.key in _TURTLE_PIXELS else "leonardo"
+    pixels = _pixels_for(name)
+    bandana = BANDANA_COLORS.get(name, BANDANA_COLORS["leonardo"])
+    skin_delta = SKIN_TINTS.get(name, (0, 0, 0))
+    return _render_prompt_toolkit(pixels, bandana, skin_delta)

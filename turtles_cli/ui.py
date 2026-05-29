@@ -18,8 +18,8 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from .mascots import mascot_frame, mascot_rich_lines
-from .modes import MODES, TurtleMode
+from .mascots import mascot_prompt_fragments, mascot_rich_lines
+from .modes import DEFAULT_MODE, MODES, TurtleMode
 
 
 console = Console()
@@ -88,6 +88,38 @@ def build_mascot(mode: TurtleMode, frame: int = 0, activity: str = "idle") -> Ta
     return mascot
 
 
+def mode_choice_preview(choice: str) -> list[tuple[str, str]]:
+    mode_name = choice.split(" - ", 1)[0]
+    mode = next((item for item in MODES.values() if item.name == mode_name), DEFAULT_MODE)
+    color_class = {
+        "blue": "class:preview-blue",
+        "purple": "class:preview-purple",
+        "red": "class:preview-red",
+        "orange1": "class:preview-orange",
+    }.get(mode.color, "class:preview-title")
+    short_mask = {
+        "leonardo": "LEO",
+        "donatello": "DON",
+        "raphael": "RPH",
+        "michelangelo": "MIK",
+    }.get(mode.key, "TUR")
+    lines = [
+        ("class:preview-title", "Live CLI preview\n"),
+        ("class:preview-muted", "The preview changes as you move.\n\n"),
+        (color_class, f"[{short_mask}] {mode.name}\n"),
+        ("class:preview-muted", f"{mode.personality}\n{mode.focus}\n\n"),
+    ]
+    lines.extend(mascot_prompt_fragments(mode))
+    lines.extend(
+        [
+            ("", "\n"),
+            ("class:preview-toolbar", f" Tab complete | {mode.name} | provider | model \n"),
+            ("class:preview-muted", "\nEnter selects this mode. Esc keeps current mode.\n"),
+        ]
+    )
+    return lines
+
+
 def divider() -> None:
     if UNICODE_OK:
         console.rule(style="dim")
@@ -140,7 +172,7 @@ def choose_mode(default_key: str = "leonardo") -> TurtleMode:
     labels = [f"{mode.name} - {mode.personality}; {short_focus[mode.key]}" for mode in MODES.values()]
     default_mode = MODES.get(default_key, next(iter(MODES.values())))
     default_label = next(label for label in labels if label.startswith(default_mode.name))
-    answer = choose_from_keyboard("Choose turtle mode", labels, default=default_label)
+    answer = choose_from_keyboard("Choose turtle mode", labels, default=default_label, preview=mode_choice_preview)
     divider()
     selected_name = answer.split(" - ", 1)[0]
     return next((mode for mode in MODES.values() if mode.name == selected_name), default_mode)
@@ -172,6 +204,20 @@ def assistant_message(message: str, mode: TurtleMode) -> None:
 
 def shell_footer() -> None:
     console.print("[dim]? for shortcuts                                                Thinking off (tab to toggle)[/dim]")
+
+
+def command_pick_animation(command: str, mode: TurtleMode, *, enabled: bool = True) -> None:
+    if not enabled or not console.is_terminal:
+        return
+    frames = [
+        f"[bold {mode.color}]mask on[/bold {mode.color}]  {command}",
+        f"[bold {mode.color}]shadow step[/bold {mode.color}]  {command}",
+        f"[bold {mode.color}]shell strike[/bold {mode.color}]  {command}",
+    ]
+    with Live("", console=console, refresh_per_second=12, transient=True) as live:
+        for frame in frames:
+            live.update(Text.from_markup(f"> {frame}"))
+            time.sleep(0.08)
 
 
 @contextmanager

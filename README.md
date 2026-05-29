@@ -1,8 +1,47 @@
-# Turtles CLI
+# 🐢 Turtles CLI
 
-Project prep shell for coding assistants. Turtles CLI helps you audit a repo, shape prompts, manage provider login, test model connectivity, and scaffold assistant assets before handing work to tools like Claude, Codex, or Gemini.
+**Project prep shell for coding assistants.**
 
-## Install
+Turtles CLI is an interactive terminal tool that gets your repo ready before handing work off to AI coding assistants like Claude, Codex, or Gemini. It handles provider auth, model testing, context estimation, code review, security scanning, and asset scaffolding all from a single shell.
+
+---
+
+## Contents
+
+- [Features](#features)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Commands](#commands)
+- [Providers](#providers)
+- [Assistant Assets](#assistant-assets)
+- [GitHub MCP Integration](#github-mcp-integration)
+- [Project Structure](#project-structure)
+- [Configuration](#configuration)
+- [License](#license)
+
+---
+
+## Features
+
+- 🔐 **Provider auth** — scoped per project, not globally
+- 🤖 **Multi-provider support** — Anthropic, OpenAI, Gemini, Ollama, Azure, AWS, and more
+- 🔍 **Code quality tools** — review heuristics, secret scanning, Dockerfile audits
+- 💬 **Prompt workflows** — build, enhance, and evaluate prompts against a live model
+- 📦 **Asset scaffolding** — generate skills, subagents, and plugins for Claude, Codex, and Gemini
+- 🔗 **MCP integration** — configure and diagnose GitHub MCP servers
+- 💡 **Interactive shell** — plain chat with `@path` file references and tab completion
+
+---
+
+## Prerequisites
+
+- Python 3.11+
+- [`uv`](https://github.com/astral-sh/uv) package manager
+
+---
+
+## Installation
 
 ```bash
 uv sync --extra dev
@@ -21,74 +60,158 @@ Run the local server:
 uv run turtles-server --host 127.0.0.1 --port 8765
 ```
 
-## First Use
+---
+
+## Quick Start
 
 ```text
-> /login
-> /test-model
-> /init
-> /help
+> /login          # Connect your provider and set credentials
+> /test-model     # Verify connectivity with a live request
+> /init           # Create .turtles/config.json and TURTLE.md
+> /help           # Show all available commands
 ```
 
-Credentials are stored per project in `.turtles/config.json`. Do not commit `.turtles/`.
+Credentials are stored per project in `.turtles/config.json`. **Do not commit `.turtles/` to version control.**
 
-## Core Commands
+---
 
-| Command | Purpose |
-| --- | --- |
-| `/login`, `/logout` | Configure or clear project-scoped provider credentials. |
-| `/models` | List or switch the active model. |
-| `/test-model` | Send a live request to verify provider/model connectivity. |
-| `/init` | Create `.turtles/config.json` and `TURTLE.md` project instructions. |
-| `/mode` | Switch turtle mode. |
-| `/code-review` | Run local review heuristics. |
-| `/security` | Scan for secrets and risky patterns. |
-| `/docker` | Audit Dockerfile and Compose files. |
-| `/context` | Estimate context window usage. |
-| `/create-prompt` | Build a structured prompt. |
-| `/enhance-prompt` | Improve a prompt with the configured model. |
-| `/prompt-eval` | Evaluate prompt quality with the configured model. |
-| `/simulation` | Ask the configured model for a scenario risk/plan/test assessment. |
-| `/docs` | Create a custom instruction Markdown file, such as `database.md`, `design.md`, or `backend.md`. |
-| `/skills` | List, install, or create project skills. |
-| `/subagents` | List, install, or create project subagents. |
-| `/plugins` | List, install, create, enable, or disable plugins. |
-| `/mcp` | List, add, or check MCP servers. |
-| `/github` | Choose git, GitHub CLI, and GitHub MCP actions. |
-| `/web-search` | Search the web. |
-| `/bash` | Run a shell command from the project root. |
+## Commands
 
-AI-backed commands require `/login`; if the provider call fails, the CLI reports the error instead of pretending a local result is from the model. Commands that create custom generated content, such as `/docs`, use the active model.
+### Setup & Auth
+
+| Command | Description |
+|---|---|
+| `/login` | Configure project-scoped provider credentials |
+| `/logout` | Clear stored credentials |
+| `/models` | List available models or switch the active one |
+| `/test-model` | Send a live request to verify provider and model connectivity |
+
+### Project Initialization
+
+| Command | Description |
+|---|---|
+| `/init` | Create `.turtles/config.json` and `TURTLE.md` project instructions |
+| `/mode` | Switch turtle mode with a visual CLI preview |
+| `/context` | Estimate current context window usage |
+
+### Code Quality
+
+| Command | Description |
+|---|---|
+| `/code-review` | Run local review heuristics, then ask the model to prioritize findings |
+| `/security` | Scan for secrets and risky patterns, then ask the model to assess risk |
+| `/docker` | Audit Dockerfile and Compose files, then ask the model for fixes |
+
+### Prompt Engineering
+
+| Command | Description |
+|---|---|
+| `/create-prompt` | Build a structured prompt interactively |
+| `/enhance-prompt` | Improve a prompt using the configured model |
+| `/prompt-eval` | Evaluate prompt quality with the configured model |
+| `/simulation` | Ask the model for a scenario risk/plan/test assessment. Supports `@path` references |
+
+### Assets & Documentation
+
+| Command | Description |
+|---|---|
+| `/docs` | Create a custom instruction Markdown file (e.g. `database.md`, `backend.md`) |
+| `/skills` | List, install, or create project skills |
+| `/subagents` | List, install, or create project subagents |
+| `/plugins` | List, install, create, enable, or disable plugins |
+
+### Integrations & Utilities
+
+| Command | Description |
+|---|---|
+| `/mcp` | List, add, or check MCP servers |
+| `/github` | Choose git, GitHub CLI, and GitHub MCP actions |
+| `/web-search` | Search the web |
+| `/bash` | Run a shell command from the project root |
+
+> **Note:** AI-backed commands require `/login`. If a provider call fails, the CLI reports the error directly — it never substitutes a local result as if it came from the model. Setup and utility commands (`/login`, `/logout`, `/mode`, `/help`, `/bash`, `/github`, `/web-search`, `/mcp list`, `/mcp check-github`) always run locally.
+
+---
 
 ## Providers
 
-Supported login targets include OpenRouter, Anthropic, OpenAI, Google Gemini, NVIDIA AI, xAI, Azure OpenAI, Ollama, AWS Bedrock metadata, and custom OpenAI-compatible endpoints.
+Turtles CLI supports logging in to the following providers:
 
-Use `/test-model` after `/login` to verify the selected model and credentials. The default example username is `user`; project-local config stores the actual name you choose.
+| Provider | Notes |
+|---|---|
+| Anthropic | Claude model family |
+| OpenAI | GPT model family |
+| OpenRouter | Unified API for many providers |
+| Google Gemini | Gemini model family |
+| NVIDIA AI | NVIDIA-hosted models |
+| xAI | Grok model family |
+| Azure OpenAI | Azure-hosted OpenAI models |
+| Ollama | Local model inference |
+| AWS Bedrock | Metadata-based login |
+| Custom endpoint | Any OpenAI-compatible API |
+
+After logging in, always run `/test-model` to confirm your selected model and credentials are working.
+
+---
 
 ## Assistant Assets
 
-`create` is the only generation verb used by the CLI. It writes portable project assets:
+The `/skills`, `/subagents`, and `/plugins` commands scaffold portable project assets using `create` as the single generation verb. Output paths follow each assistant's conventions:
 
-```text
+**Skills**
+```
 .claude/skills/<name>/SKILL.md
 .codex/skills/<name>/SKILL.md
 .gemini/skills/<name>/SKILL.md
+```
 
+**Subagents / Agents**
+```
 .claude/agents/<name>.md
 .codex/agents/<name>.md
 .gemini/agents/<name>.md
+```
 
+**Plugins**
+```
 plugins/<name>/.claude-plugin/plugin.json
 plugins/<name>/.codex-plugin/plugin.json
 plugins/<name>/.gemini-plugin/plugin.json
 ```
 
-For Codex and Gemini, the CLI also updates project instruction files (`AGENTS.md` and `GEMINI.md`) with references to the created assets.
+For Codex and Gemini, the CLI also updates the relevant project instruction files (`AGENTS.md` and `GEMINI.md`) with references to newly created assets.
 
-## Project Layout
+---
+
+## GitHub MCP Integration
+
+Turtles CLI expects a project MCP server named `github`, configured with the stdio command `github-mcp-server` by default.
+
+**Test the GitHub MCP server:**
 
 ```text
+> /mcp check-github
+```
+
+The diagnostic checks whether the server is configured and enabled, whether the executable is on `PATH`, whether `GITHUB_TOKEN` is set, and whether the command responds to `--help`.
+
+**Use a different executable:**
+
+```text
+> /mcp add-stdio
+Server name: github
+stdio command: <your github mcp server command>
+
+> /mcp check-github
+```
+
+> MCP transport support is still early. `/mcp check-github` and `/github mcp-check` are the recommended diagnostic commands.
+
+---
+
+## Project Structure
+
+```
 turtles_cli/
   main.py       # Typer entry point and shell loop
   commands.py   # Slash commands
@@ -104,13 +227,18 @@ turtles_cli/
 tests/
 ```
 
-## Notes
+Runtime state lives in `.turtles/`.
 
-- Runtime state lives in `.turtles/`.
-- Local scanners do not need a model.
-- Provider-backed commands do need a working model.
-- MCP transport support is still early; `/mcp check-github` and `/github mcp-check` provide diagnostics.
+---
+
+## Configuration
+
+Project configuration is stored in `.turtles/config.json` after running `/init`. This file holds your provider credentials, active model selection, and project metadata. The default example username is `user`; the actual name you choose is stored locally and never shared.
+
+**Do not commit `.turtles/` to your repository.**
+
+---
 
 ## License
 
-MIT
+[MIT](LICENSE)

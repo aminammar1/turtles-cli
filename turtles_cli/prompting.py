@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import sys
+from collections.abc import Callable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
@@ -10,7 +12,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
 from prompt_toolkit.widgets import FormattedTextToolbar
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
@@ -114,6 +116,8 @@ COLOR_MAP = {
     "green": "#67d587",
 }
 
+PROJECT_COMPLETION_IGNORES = {".git", ".turtles", ".venv", "__pycache__", "node_modules", "dist", "build"}
+
 
 class SlashCommandCompleter(Completer):
     def get_completions(self, document: Document, complete_event):
@@ -139,23 +143,87 @@ class SlashCommandCompleter(Completer):
                 )
 
 
+def project_path_choices(root: Path, *, limit: int = 600) -> list[tuple[str, str]]:
+    choices: list[tuple[str, str]] = []
+    for path in root.rglob("*"):
+        relative_parts = path.relative_to(root).parts
+        if any(part in PROJECT_COMPLETION_IGNORES for part in relative_parts):
+            continue
+        if path.is_dir():
+            choices.append((str(path.relative_to(root)) + "/", "directory"))
+        elif path.is_file():
+            choices.append((str(path.relative_to(root)), "file"))
+        if len(choices) >= limit:
+            break
+    return sorted(choices, key=lambda item: (item[1] != "directory", item[0].lower()))
+
+
+class ProjectCompleter(Completer):
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.slash = SlashCommandCompleter()
+
+    def get_completions(self, document: Document, complete_event):
+        yield from self.slash.get_completions(document, complete_event)
+
+        match = re.search(r"@([A-Za-z0-9._/\-]*)$", document.text_before_cursor)
+        if not match:
+            return
+        token = match.group(1)
+        needle = token.lower()
+        matches: list[tuple[str, str]] = []
+        for path, kind in project_path_choices(self.root):
+            lowered = path.lower()
+            basename = Path(path.rstrip("/")).name.lower()
+            if lowered.startswith(needle) or basename.startswith(needle) or needle in lowered:
+                matches.append((path, kind))
+            if len(matches) >= 30:
+                break
+        for path, kind in matches:
+            yield Completion(
+                f"@{path}",
+                start_position=-(len(token) + 1),
+                display=f"@{path}",
+                display_meta=kind,
+            )
+
+
+def project_completion_bindings(*, exit_result: str = "") -> KeyBindings:
+    bindings = KeyBindings()
+
+    @bindings.add("c-d")
+    def _(event) -> None:
+        event.app.exit(result=exit_result)
+
+    @bindings.add("@")
+    def _(event) -> None:
+        event.current_buffer.insert_text("@")
+        event.current_buffer.start_completion(select_first=False)
+
+    @bindings.add("enter")
+    def _(event) -> None:
+        complete_state = event.current_buffer.complete_state
+        if complete_state and complete_state.current_completion:
+            event.current_buffer.apply_completion(complete_state.current_completion)
+            return
+        event.current_buffer.validate_and_handle()
+
+    return bindings
+
+
 def make_command_session(root: Path, mode: TurtleMode, config: TurtlesConfig) -> PromptSession[str]:
     command_color = COLOR_MAP.get(mode.color, COLOR_MAP["green"])
     provider = PROVIDERS.get(config.provider.provider)
     provider_label = provider.label if provider else "no provider"
     model = config.provider.model or "no model"
 
-    bindings = KeyBindings()
-
-    @bindings.add("c-d")
-    def _(event) -> None:
-        event.app.exit(result="/exit")
+    bindings = project_completion_bindings(exit_result="/exit")
 
     def toolbar() -> str:
         return f"  Tab complete | Up/Down history/menu | ? help | {mode.name} | {provider_label} | {model}"
 
     return PromptSession(
-        completer=SlashCommandCompleter(),
+        completer=ProjectCompleter(root),
         complete_while_typing=True,
         auto_suggest=AutoSuggestFromHistory(),
         history=FileHistory(str(history_path(root))),
@@ -176,7 +244,35 @@ def make_command_session(root: Path, mode: TurtleMode, config: TurtlesConfig) ->
     )
 
 
-def choose_from_keyboard(title: str, choices: list[str], *, default: str) -> str:
+def ask_project_text(root: Path, label: str) -> str:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        try:
+            return input(f"{label}: ").strip()
+        except EOFError:
+            return ""
+
+    session: PromptSession[str] = PromptSession(
+        completer=ProjectCompleter(root),
+        complete_while_typing=True,
+        key_bindings=project_completion_bindings(),
+        bottom_toolbar="  Type @ for project files | Tab complete",
+        reserve_space_for_menu=6,
+        style=Style.from_dict(
+            {
+                "completion-menu.completion": "bg:#262626 #d0d0d0",
+                "completion-menu.completion.current": "bg:#67d587 #101010 bold",
+                "completion-menu.meta.completion": "bg:#262626 #8a8a8a",
+                "bottom-toolbar": "bg:#1f1f1f #8a8a8a",
+            }
+        ),
+    )
+    return session.prompt(f"{label}: ").strip()
+
+
+PreviewBuilder = Callable[[str], list[tuple[str, str]]]
+
+
+def choose_from_keyboard(title: str, choices: list[str], *, default: str, preview: PreviewBuilder | None = None) -> str:
     if not choices:
         return default
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -217,6 +313,11 @@ def choose_from_keyboard(title: str, choices: list[str], *, default: str) -> str
             style = "class:current" if row == selected else "class:item"
             lines.append((style, f"{pointer} {row + 1}. {choice}\n"))
         return lines
+
+    def preview_text():
+        if not preview:
+            return []
+        return preview(current_choice())
 
     bindings = KeyBindings()
 
@@ -273,7 +374,15 @@ def choose_from_keyboard(title: str, choices: list[str], *, default: str) -> str
         layout=Layout(
             HSplit(
                 [
-                    Window(FormattedTextControl(formatted_text), always_hide_cursor=True),
+                    VSplit(
+                        [
+                            Window(FormattedTextControl(formatted_text), always_hide_cursor=True, width=42),
+                            Window(width=2, char=" "),
+                            Window(FormattedTextControl(preview_text), always_hide_cursor=True),
+                        ]
+                    )
+                    if preview
+                    else Window(FormattedTextControl(formatted_text), always_hide_cursor=True),
                     FormattedTextToolbar(lambda: "Turtles CLI keyboard selector"),
                 ]
             )
@@ -286,6 +395,13 @@ def choose_from_keyboard(title: str, choices: list[str], *, default: str) -> str
                 "help": "#8a8a8a",
                 "item": "#d0d0d0",
                 "current": "bold #101010 bg:#67d587",
+                "preview-title": "bold #67d587",
+                "preview-muted": "#8a8a8a",
+                "preview-blue": "bold #5aa9ff",
+                "preview-purple": "bold #b48cff",
+                "preview-red": "bold #ff6b6b",
+                "preview-orange": "bold #ffb454",
+                "preview-toolbar": "bg:#1f1f1f #8a8a8a",
             }
         ),
     )

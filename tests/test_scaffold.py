@@ -8,6 +8,7 @@ def test_create_skill_uses_claude_skill_structure(tmp_path) -> None:
 
     assert result.path == tmp_path / ".claude" / "skills" / "security-audit" / "SKILL.md"
     assert "description: Audit secrets" in result.path.read_text(encoding="utf-8")
+    assert "local Turtles CLI scaffold template" in result.path.read_text(encoding="utf-8")
     assert (tmp_path / ".codex" / "skills" / "security-audit" / "SKILL.md").exists()
     assert (tmp_path / ".gemini" / "skills" / "security-audit" / "SKILL.md").exists()
     assert "security-audit" in (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
@@ -30,6 +31,7 @@ def test_create_subagent_uses_claude_agent_structure(tmp_path) -> None:
 
     assert result.path == tmp_path / ".claude" / "agents" / "code-reviewer.md"
     assert "tools:" in result.path.read_text(encoding="utf-8")
+    assert "local Turtles CLI scaffold template" in result.path.read_text(encoding="utf-8")
     assert (tmp_path / ".codex" / "agents" / "code-reviewer.md").exists()
     assert (tmp_path / ".gemini" / "agents" / "code-reviewer.md").exists()
 
@@ -40,6 +42,7 @@ def test_create_plugin_uses_plugin_manifest_structure(tmp_path) -> None:
 
     assert result.path == tmp_path / "plugins" / "workflow-pack" / ".claude-plugin" / "plugin.json"
     assert manifest["name"] == "workflow-pack"
+    assert "local Turtles CLI scaffold template" in (tmp_path / "plugins" / "workflow-pack" / "README.md").read_text(encoding="utf-8")
     assert (tmp_path / "plugins" / "workflow-pack" / ".codex-plugin" / "plugin.json").exists()
     assert (tmp_path / "plugins" / "workflow-pack" / ".gemini-plugin" / "plugin.json").exists()
     assert (tmp_path / "plugins" / "workflow-pack" / "skills" / "review" / "SKILL.md").exists()
